@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <title>EcoSlice</title>
+
+    <style>
+
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1000px;
+            margin: 40px auto;
+            padding: 20px;
+        }
+
+        h1 {
+            font-size: 42px;
+        }
+
+        .card {
+            border: 1px solid #ddd;
+            border-radius: 12px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+
+        textarea {
+            width: 100%;
+            height: 100px;
+            margin-top: 10px;
+        }
+
+        button {
+            padding: 12px 24px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            margin-top: 15px;
+        }
+
+        .options {
+            display: grid;
+            grid-template-columns:
+                repeat(3, 1fr);
+            gap: 15px;
+        }
+
+        .option {
+            border: 1px solid #ddd;
+            padding: 20px;
+            border-radius: 10px;
+        }
+
+    </style>
+
+</head>
+
+<body>
+
+<h1>EcoSlice</h1>
+
+<p>
+AI-powered material and energy optimization
+for functional 3D printing.
+</p>
+
+<div class="card">
+
+    <h2>1. Upload your model</h2>
+
+    <input
+        id="file"
+        type="file"
+        accept=".stl,.obj,.ply"
+    >
+
+</div>
+
+<div class="card">
+
+    <h2>2. Describe the part</h2>
+
+    <textarea
+        id="prompt"
+        placeholder="Example: drone motor mount holding 1 kg outdoors. Strength is more important than appearance."
+    ></textarea>
+
+</div>
+
+<button onclick="analyze()">
+    Analyze with EcoSlice
+</button>
+
+<div id="loading"></div>
+
+<div id="results"></div>
+
+
+<script>
+
+async function analyze() {
+
+    const fileInput =
+        document.getElementById("file");
+
+    const prompt =
+        document.getElementById("prompt");
+
+    if (!fileInput.files.length) {
+
+        alert("Upload an STL first.");
+
+        return;
+    }
+
+    document.getElementById("loading")
+        .innerText =
+        "EcoSlice is analyzing your model...";
+
+    const formData =
+        new FormData();
+
+    formData.append(
+        "file",
+        fileInput.files[0]
+    );
+
+    formData.append(
+        "prompt",
+        prompt.value
+    );
+
+    try {
+
+        const response =
+            await fetch(
+                "http://127.0.0.1:8000/analyze",
+                {
+                    method: "POST",
+                    body: formData
+                }
+            );
+
+        const data =
+            await response.json();
+
+        displayResults(data);
+
+    } catch (error) {
+
+        console.error(error);
+
+        alert(
+            "Could not connect to EcoSlice."
+        );
+
+    }
+
+}
+
+
+function displayResults(data) {
+
+    document.getElementById("loading")
+        .innerText = "";
+
+    const results =
+        document.getElementById("results");
+
+    results.innerHTML = "";
+
+    if (!data.success) {
+
+        results.innerText =
+            data.detail;
+
+        return;
+    }
+
+    const geometry =
+        data.geometry;
+
+    results.innerHTML += `
+
+        <div class="card">
+
+            <h2>Geometry Analysis</h2>
+
+            <p>
+                Dimensions:
+                ${geometry.dimensions.x_mm.toFixed(1)}
+                ×
+                ${geometry.dimensions.y_mm.toFixed(1)}
+                ×
+                ${geometry.dimensions.z_mm.toFixed(1)}
+                mm
+            </p>
+
+            <p>
+                Volume:
+                ${geometry.volume_mm3.toFixed(1)}
+                mm³
+            </p>
+
+            <p>
+                Triangles:
+                ${geometry.triangles}
+            </p>
+
+        </div>
+
+        <div class="card">
+
+            <h2>Printability</h2>
+
+            <p>
+                Potential overhang:
+                ${data.overhang.overhang_percentage}%
+            </p>
+
+            <p>
+                Estimated critical vertices:
+                ${data.stress.estimated_high_stress_vertices}
+            </p>
+
+        </div>
+
+        <div class="card">
+
+            <h2>Optimization Options</h2>
+
+            <div class="options">
+
+                ${createOption(
+                    "Eco",
+                    data.options.eco
+                )}
+
+                ${createOption(
+                    "Balanced",
+                    data.options.balanced
+                )}
+
+                ${createOption(
+                    "Maximum Strength",
+                    data.options.strength
+                )}
+
+            </div>
+
+        </div>
+    `;
+}
+
+
+function createOption(
+    name,
+    option
+) {
+
+    return `
+
+        <div class="option">
+
+            <h3>${name}</h3>
+
+            <p>
+                Material:
+                <strong>
+                    ${option.material_g} g
+                </strong>
+            </p>
+
+            <p>
+                Time:
+                <strong>
+                    ${option.print_time_min} min
+                </strong>
+            </p>
+
+            <p>
+                Energy:
+                <strong>
+                    ${option.energy_kwh} kWh
+                </strong>
+            </p>
+
+            <p>
+                Walls:
+                ${option.walls}
+            </p>
+
+            <p>
+                Infill:
+                ${option.infill}%
+            </p>
+
+            <p>
+                Strength confidence:
+                ${option.strength_confidence}%
+            </p>
+
+        </div>
+    `;
+}
+
+</script>
+
+</body>
+
+</html>
