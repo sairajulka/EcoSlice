@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>EcoSlice</title>
+    <link rel="stylesheet" href="ecoslice.css">
+</head>
+
+<body>
+
+<div class="app">
+
+    <!-- HEADER -->
+
+    <header class="header">
+
+        <div>
+            <div class="brand">
+                <span class="logo">◉</span>
+                EcoSlice
+            </div>
+
+            <div class="subtitle">
+                AI-assisted material, energy, and strength optimization
+            </div>
+        </div>
+
+        <div class="version">
+            v0.2.0
+        </div>
+
+    </header>
+
+
+    <!-- MODEL -->
+
+    <section class="section">
+
+        <div class="section-title">
+            <span class="number">01</span>
+            Current Model
+        </div>
+
+        <div class="model-card">
+
+            <div>
+                <div class="model-name" id="model-name">
+                    Garden Hose Holder
+                </div>
+
+                <div class="model-description">
+                    Active OrcaSlicer model
+                </div>
+            </div>
+
+            <div class="status">
+                ● Analysis complete
+            </div>
+
+        </div>
+
+    </section>
+
+
+    <!-- GEOMETRY -->
+
+    <section class="section">
+
+        <div class="section-title">
+            <span class="number">02</span>
+            Geometry
+        </div>
+
+        <div class="metrics">
+
+            <div class="metric">
+                <div class="metric-label">Volume</div>
+                <div class="metric-value">15,550</div>
+                <div class="metric-unit">mm³</div>
+            </div>
+
+            <div class="metric">
+                <div class="metric-label">Triangles</div>
+                <div class="metric-value">225,154</div>
+                <div class="metric-unit">mesh faces</div>
+            </div>
+
+            <div class="metric">
+                <div class="metric-label">Support Risk</div>
+                <div class="metric-value">10.7%</div>
+                <div class="metric-unit">estimated</div>
+            </div>
+
+        </div>
+
+    </section>
+
+
+    <!-- ENGINEERING INTENT -->
+
+    <section class="section">
+
+        <div class="section-title">
+            <span class="number">03</span>
+            Engineering Intent
+        </div>
+
+        <div class="intent-card">
+
+            <div class="intent-row">
+                <span>Priority</span>
+                <strong>Strength</strong>
+            </div>
+
+            <div class="intent-row">
+                <span>Load</span>
+                <strong>Not specified</strong>
+            </div>
+
+            <div class="intent-row">
+                <span>Outdoor</span>
+                <strong>No</strong>
+            </div>
+
+            <div class="intent-row">
+                <span>Vibration</span>
+                <strong>No</strong>
+            </div>
+
+        </div>
+
+    </section>
+
+
+    <!-- OPTIMIZATION -->
+
+    <section class="section">
+
+        <div class="optimization-heading">
+
+            <div>
+                <div class="section-title">
+                    <span class="number">04</span>
+                    Optimization
+                </div>
+
+                <div class="optimization-subtitle">
+                    Choose how EcoSlice should prioritize the print.
+                </div>
+            </div>
+
+        </div>
+
+
+        <div class="options">
+
+
+            <!-- ECO -->
+
+            <div class="option-card" data-option="eco">
+
+                <div class="option-header">
+
+                    <div>
+                        <div class="option-name">
+                            Eco
+                        </div>
+
+                        <div class="option-description">
+                            Minimize material and print time
+                        </div>
+                    </div>
+
+                </div>
+
+                <div class="option-stat">
+
+                    <span>Walls</span>
+                    <strong>2</strong>
+
+                </div>
+
+                <div class="option-stat">
+
+                    <span>Infill</span>
+                    <strong>12%</strong>
+
+                </div>
+
+                <div class="option-divider"></div>
+
+                <div class="big-stat">
+                    6.1 g
+                </div>
+
+                <div class="small-stat">
+                    0.73 h
+                </div>
+
+                <div class="small-stat">
+                    0.09 kWh
+                </div>
+
+                <div class="confidence">
+
+                    <span>Strength confidence</span>
+
+                    <strong>71%</strong>
+
+                </div>
+
+                <button class="select-button">
+                    Select Eco
+                </button>
+
+            </div>
+
+
+            <!-- BALANCED -->
+
+            <div class="option-card recommended"
+                 data-option="balanced">
+
+                <div class="recommended-label">
+                    RECOMMENDED
+                </div>
+
+                <div class="option-header">
+
+                    <div>
+
+                        <div class="option-name">
+                            Balanced
+                        </div>
+
+                        <div class="option-description">
+                            Balance strength, material, and time
+                        </div>
+
+                    </div>
+
+                </div>
+
+                <div class="option-stat">
+
+                    <span>Walls</span>
+                    <strong>4</strong>
+
+                </div>
+
+                <div class="option-stat">
+
+                    <span>Infill</span>
+                    <strong>30%</strong>
+
+                </div>
+
+                <div class="option-divider"></div>
+
+                <div class="big-stat">
+                    9.4 g
+                </div>
+
+                <div class="small-stat">
+                    1.12 h
+                </div>
+
+                <div class="small-stat">
+                    0.13 kWh
+                </div>
+
+                <div class="confidence">
+
+                    <span>Strength confidence</span>
+
+                    <strong>87%</strong>
+
+                </div>
+
+                <button class="select-button primary">
+                    Select Balanced
+                </button>
+
+            </div>
+
+
+            <!-- MAXIMUM STRENGTH -->
+
+            <div class="option-card"
+                 data-option="maximum">
+
+                <div class="option-header">
+
+                    <div>
+
+                        <div class="option-name">
+                            Maximum Strength
+                        </div>
+
+                        <div class="option-description">
+                            Prioritize structural robustness
+                        </div>
+
+                    </div>
+
+                </div>
+
+                <div class="option-stat">
+
+                    <span>Walls</span>
+                    <strong>6</strong>
+
+                </div>
+
+                <div class="option-stat">
+
+                    <span>Infill</span>
+                    <strong>55%</strong>
+
+                </div>
+
+                <div class="option-divider"></div>
+
+                <div class="big-stat">
+                    13.4 g
+                </div>
+
+                <div class="small-stat">
+                    1.60 h
+                </div>
+
+                <div class="small-stat">
+                    0.19 kWh
+                </div>
+
+                <div class="confidence">
+
+                    <span>Strength confidence</span>
+
+                    <strong>96%</strong>
+
+                </div>
+
+                <button class="select-button">
+                    Select Maximum
+                </button>
+
+            </div>
+
+        </div>
+
+    </section>
+
+
+    <!-- WHAT ECOSLICE CHANGES -->
+
+    <section class="section">
+
+        <div class="section-title">
+            <span class="number">05</span>
+            What EcoSlice Changes
+        </div>
+
+        <div class="changes">
+
+            <div class="change">
+                <span>+</span>
+                <div>
+                    <strong>Wall thickness</strong>
+                    <p>Increase walls near structural regions.</p>
+                </div>
+            </div>
+
+            <div class="change">
+                <span>+</span>
+                <div>
+                    <strong>Infill density</strong>
+                    <p>Add density where loads are concentrated.</p>
+                </div>
+            </div>
+
+            <div class="change">
+                <span>−</span>
+                <div>
+                    <strong>Unnecessary supports</strong>
+                    <p>Reduce support material in low-risk areas.</p>
+                </div>
+            </div>
+
+        </div>
+
+    </section>
+
+
+    <!-- ACTION -->
+
+    <div class="footer">
+
+        <button id="optimize"
+                class="optimize-button">
+
+            ✨ Optimize with EcoSlice
+
+        </button>
+
+    </div>
+
+</div>
+
+<script src="ecoslice.js"></script>
+
+</body>
+</html>
