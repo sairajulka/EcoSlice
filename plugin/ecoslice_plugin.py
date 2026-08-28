@@ -1,621 +1,1488 @@
 # /// script
-# requires-python = ">=3.12"
 # dependencies = ["numpy"]
-#
-# [tool.orcaslicer.plugin]
-# name = "EcoSlice"
-# description = "AI-powered material, strength, and energy optimization for functional 3D printing."
-# author = "Saira Julka"
-# version = "0.2.0"
 # ///
 
+import json
 import math
-import re
+import traceback
+
 import numpy as np
 import orca
 
 
+PLUGIN_VERSION = "0.2.0"
+
+
 # ============================================================
-# ECO SLICE — ENGINEERING ANALYSIS
+# ECO SLICE ANALYSIS ENGINE
 # ============================================================
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+class EcoAnalyzer:
 
+    def __init__(self):
+        self.last_snapshot = None
 
-def analyze_mesh(mesh):
-    """
-    Extract geometry and calculate basic manufacturing risks.
-    """
+    def analyze_current_model(self):
+        """
+        Read the currently loaded OrcaSlicer model.
 
-    vertices = np.asarray(mesh.vertices(), dtype=float)
-    triangles = np.asarray(mesh.triangles(), dtype=np.int64)
+        IMPORTANT:
+        OrcaSlicer's normal host API is read-only.
+        We analyze a snapshot rather than modifying the model.
+        """
 
-    vertex_count = len(vertices)
-    triangle_count = len(triangles)
+        model = orca.host.model()
 
-    if triangle_count == 0:
-        return {
-            "vertices": vertex_count,
-            "triangles": 0,
-            "volume_mm3": 0,
-            "dimensions_mm": (0, 0, 0),
-            "manifold": False,
-            "overhang": {},
+        objects = model.objects()
+
+        if not objects:
+            raise RuntimeError(
+                "No model is loaded in OrcaSlicer."
+            )
+
+        all_vertices = []
+        all_triangles = []
+
+        object_reports = []
+
+        vertex_offset = 0
+
+        for object_index, obj in enumerate(objects):
+
+            for volume_index, volume in enumerate(obj.volumes()):
+
+                mesh = volume.mesh()
+
+                if mesh.is_empty():
+                    continue
+
+                vertices = np.asarray(mesh.vertices())
+                triangles = np.asarray(mesh.triangles())
+
+                # ------------------------------------------------
+                # Convert local mesh coordinates to world coords
+                # ------------------------------------------------
+
+                try:
+                    instance = obj.instance(0)
+
+                    world_matrix = (
+                        instance.matrix() @ volume.matrix()
+                    )
+
+                    homogeneous = np.c_[
+                        vertices.astype(np.float64),
+                        np.ones(len(vertices))
+                    ]
+
+                    world_vertices = (
+                        homogeneous @ world_matrix.T
+                    )[:, :3]
+
+                except Exception:
+                    # Fallback to local coordinates
+                    world_vertices = vertices.astype(
+                        np.float64
+                    )
+
+                triangles_world = (
+                    triangles.astype(np.int32)
+                    + vertex_offset
+                )
+
+                all_vertices.append(world_vertices)
+                all_triangles.append(triangles_world)
+
+                vertex_offset += len(world_vertices)
+
+                object_reports.append({
+                    "name": getattr(
+                        volume,
+                        "name",
+                        f"Object {object_index + 1}"
+                    ),
+                    "volume_mm3": float(mesh.volume()),
+                    "triangles": int(mesh.triangle_count()),
+                    "manifold": bool(mesh.is_manifold()),
+                })
+
+        if not all_vertices:
+            raise RuntimeError(
+                "The current OrcaSlicer model contains no mesh geometry."
+            )
+
+        vertices = np.vstack(all_vertices)
+        triangles = np.vstack(all_triangles)
+
+        # --------------------------------------------------------
+        # Geometry statistics
+        # --------------------------------------------------------
+
+        minimum = vertices.min(axis=0)
+        maximum = vertices.max(axis=0)
+
+        dimensions = maximum - minimum
+
+        volume_mm3 = 0.0
+
+        for report in object_reports:
+            volume_mm3 += report["volume_mm3"]
+
+        # --------------------------------------------------------
+        # Face normals
+        # --------------------------------------------------------
+
+        tri_vertices = vertices[triangles]
+
+        edge_a = (
+            tri_vertices[:, 1]
+            - tri_vertices[:, 0]
+        )
+
+        edge_b = (
+            tri_vertices[:, 2]
+            - tri_vertices[:, 0]
+        )
+
+        normals = np.cross(edge_a, edge_b)
+
+        normal_lengths = np.linalg.norm(
+            normals,
+            axis=1
+        )
+
+        normal_lengths[
+            normal_lengths == 0
+        ] = 1
+
+        normals = (
+            normals
+            / normal_lengths[:, None]
+        )
+
+        # --------------------------------------------------------
+        # Overhang analysis
+        # --------------------------------------------------------
+
+        # Z component tells us how downward-facing the face is.
+        downward = -normals[:, 2]
+
+        # Approximate overhang threshold:
+        # 0.5 corresponds to roughly 60 degrees from horizontal.
+        support_mask = downward > 0.5
+
+        support_ratio = (
+            float(np.mean(support_mask))
+            if len(support_mask)
+            else 0.0
+        )
+
+        support_risk = min(
+            99.0,
+            support_ratio * 100.0
+        )
+
+        # --------------------------------------------------------
+        # Heuristic stress map
+        #
+        # THIS IS NOT FEA.
+        #
+        # It is a visualization heuristic based on:
+        # - downward-facing geometry
+        # - height
+        # - local geometry
+        #
+        # Actual FEA/PINN comes later.
+        # --------------------------------------------------------
+
+        face_centers = tri_vertices.mean(axis=1)
+
+        z_min = minimum[2]
+        z_max = maximum[2]
+
+        z_range = max(
+            0.001,
+            z_max - z_min
+        )
+
+        normalized_height = (
+            face_centers[:, 2] - z_min
+        ) / z_range
+
+        stress = (
+            0.55 * downward
+            + 0.25 * normalized_height
+            + 0.20 * np.abs(normals[:, 0])
+        )
+
+        stress = np.clip(
+            stress,
+            0,
+            1
+        )
+
+        # --------------------------------------------------------
+        # Support points
+        # --------------------------------------------------------
+
+        support_points = self.generate_support_points(
+            vertices,
+            triangles,
+            normals,
+            support_mask
+        )
+
+        # --------------------------------------------------------
+        # Optimization estimates
+        # --------------------------------------------------------
+
+        profiles = self.generate_profiles(
+            volume_mm3,
+            support_risk,
+            dimensions
+        )
+
+        # --------------------------------------------------------
+        # Sample mesh for browser performance
+        # --------------------------------------------------------
+
+        sampled_triangles = self.sample_mesh(
+            vertices,
+            triangles,
+            stress,
+            max_triangles=4500
+        )
+
+        result = {
+            "version": PLUGIN_VERSION,
+
+            "geometry": {
+                "volume_mm3": round(volume_mm3, 2),
+
+                "triangles": int(
+                    len(triangles)
+                ),
+
+                "dimensions_mm": [
+                    round(float(x), 2)
+                    for x in dimensions
+                ],
+
+                "support_risk": round(
+                    support_risk,
+                    1
+                ),
+
+                "manifold": all(
+                    r["manifold"]
+                    for r in object_reports
+                )
+            },
+
+            "objects": object_reports,
+
+            "mesh": sampled_triangles,
+
+            "profiles": profiles,
+
+            "changes": self.generate_changes(
+                support_risk,
+                stress
+            ),
+
+            "analysis": {
+                "overhang_faces": int(
+                    np.sum(support_mask)
+                ),
+
+                "stress_max": round(
+                    float(stress.max()),
+                    3
+                ),
+
+                "stress_mean": round(
+                    float(stress.mean()),
+                    3
+                ),
+
+                "support_points": len(
+                    support_points
+                )
+            },
+
+            "supports": support_points
         }
 
-    # --------------------------------------------------------
-    # Triangle vertices
-    # --------------------------------------------------------
+        self.last_snapshot = result
 
-    p0 = vertices[triangles[:, 0]]
-    p1 = vertices[triangles[:, 1]]
-    p2 = vertices[triangles[:, 2]]
+        return result
 
-    # --------------------------------------------------------
-    # Triangle normals
-    # --------------------------------------------------------
+    # ==========================================================
+    # SUPPORT GENERATION
+    # ==========================================================
 
-    edges1 = p1 - p0
-    edges2 = p2 - p0
-
-    normals = np.cross(edges1, edges2)
-
-    normal_lengths = np.linalg.norm(normals, axis=1)
-
-    valid = normal_lengths > 1e-12
-
-    normals[valid] /= normal_lengths[valid, None]
-
-    # --------------------------------------------------------
-    # Triangle areas
-    # --------------------------------------------------------
-
-    areas = 0.5 * normal_lengths
-
-    total_surface_area = float(np.sum(areas))
-
-    # --------------------------------------------------------
-    # Overhang calculation
-    #
-    # Z is assumed to be the build direction.
-    #
-    # A downward-facing face has a negative Z normal.
-    # --------------------------------------------------------
-
-    z_normals = normals[:, 2]
-
-    downward = z_normals < 0
-
-    downward_area = float(np.sum(areas[downward]))
-
-    # 45 degree overhang threshold
-    threshold = math.cos(math.radians(45))
-
-    critical = downward & (z_normals < -threshold)
-
-    critical_area = float(np.sum(areas[critical]))
-
-    # More permissive 60 degree region
-    severe = downward & (z_normals < -math.cos(math.radians(60)))
-
-    severe_area = float(np.sum(areas[severe]))
-
-    overhang_ratio = (
-        critical_area / total_surface_area
-        if total_surface_area > 0
-        else 0
-    )
-
-    # --------------------------------------------------------
-    # Bounding box
-    # --------------------------------------------------------
-
-    mins = np.min(vertices, axis=0)
-    maxs = np.max(vertices, axis=0)
-
-    dimensions = maxs - mins
-
-    # --------------------------------------------------------
-    # Thin-feature heuristic
-    #
-    # This is NOT structural FEA.
-    # It is a geometry warning.
-    # --------------------------------------------------------
-
-    smallest_dimension = float(np.min(dimensions))
-
-    thin_feature_warning = smallest_dimension < 1.2
-
-    # --------------------------------------------------------
-    # Risk score
-    # --------------------------------------------------------
-
-    support_risk = clamp(
-        overhang_ratio * 100 * 1.8
-        + (severe_area / total_surface_area * 100 * 1.2
-           if total_surface_area > 0 else 0),
-        0,
-        100
-    )
-
-    if support_risk < 20:
-        risk_label = "LOW"
-    elif support_risk < 50:
-        risk_label = "MEDIUM"
-    elif support_risk < 75:
-        risk_label = "HIGH"
-    else:
-        risk_label = "VERY HIGH"
-
-    return {
-        "vertices": vertex_count,
-        "triangles": triangle_count,
-        "volume_mm3": float(mesh.volume()),
-        "dimensions_mm": tuple(float(x) for x in dimensions),
-        "manifold": bool(mesh.is_manifold()),
-        "surface_area_mm2": total_surface_area,
-        "downward_area_mm2": downward_area,
-        "critical_overhang_area_mm2": critical_area,
-        "severe_overhang_area_mm2": severe_area,
-        "overhang_ratio": overhang_ratio,
-        "support_risk": support_risk,
-        "risk_label": risk_label,
-        "thin_feature_warning": thin_feature_warning,
-    }
-
-
-# ============================================================
-# USER INTENT PARSER
-# ============================================================
-
-def parse_intent(text):
-    """
-    Convert a natural-language description into engineering
-    requirements.
-
-    This is deliberately rule-based for the first MVP.
-    Later this function can call a real LLM.
-    """
-
-    text_lower = text.lower()
-
-    result = {
-        "description": text,
-        "priority": "balanced",
-        "load_kg": None,
-        "outdoor": False,
-        "strength_priority": False,
-        "appearance_priority": False,
-        "vibration": False,
-        "cantilever": False,
-    }
-
-    # --------------------------------------------------------
-    # Priority
-    # --------------------------------------------------------
-
-    if (
-        "strength matters more" in text_lower
-        or "strength" in text_lower
-        or "strong" in text_lower
-        or "durability" in text_lower
+    def generate_support_points(
+        self,
+        vertices,
+        triangles,
+        normals,
+        support_mask
     ):
-        result["priority"] = "strength"
-        result["strength_priority"] = True
 
-    if (
-        "appearance matters more" in text_lower
-        or "appearance" in text_lower
-        or "looks" in text_lower
+        points = []
+
+        if not np.any(support_mask):
+            return points
+
+        selected_triangles = np.where(
+            support_mask
+        )[0]
+
+        # Don't try to display thousands of supports.
+        # Pick representative regions.
+        max_supports = 80
+
+        if len(selected_triangles) > max_supports:
+
+            indices = np.linspace(
+                0,
+                len(selected_triangles) - 1,
+                max_supports
+            ).astype(int)
+
+            selected_triangles = (
+                selected_triangles[indices]
+            )
+
+        for triangle_index in selected_triangles:
+
+            tri = triangles[triangle_index]
+
+            p = vertices[tri].mean(axis=0)
+
+            # Project downward to approximate build plate.
+            bottom_z = vertices[:, 2].min()
+
+            bottom = np.array([
+                p[0],
+                p[1],
+                bottom_z
+            ])
+
+            points.append({
+                "top": [
+                    round(float(p[0]), 2),
+                    round(float(p[1]), 2),
+                    round(float(p[2]), 2)
+                ],
+
+                "bottom": [
+                    round(float(bottom[0]), 2),
+                    round(float(bottom[1]), 2),
+                    round(float(bottom[2]), 2)
+                ]
+            })
+
+        return points
+
+    # ==========================================================
+    # MESH SAMPLING
+    # ==========================================================
+
+    def sample_mesh(
+        self,
+        vertices,
+        triangles,
+        stress,
+        max_triangles=4500
     ):
-        result["priority"] = "appearance"
-        result["appearance_priority"] = True
 
-    # --------------------------------------------------------
-    # Environment
-    # --------------------------------------------------------
+        count = len(triangles)
 
-    if (
-        "outdoor" in text_lower
-        or "outside" in text_lower
-        or "weather" in text_lower
+        if count <= max_triangles:
+
+            indices = np.arange(count)
+
+        else:
+
+            indices = np.linspace(
+                0,
+                count - 1,
+                max_triangles
+            ).astype(int)
+
+        sampled_vertices = []
+        sampled_stress = []
+
+        for i in indices:
+
+            tri = triangles[i]
+
+            sampled_vertices.extend([
+                vertices[tri[0]].tolist(),
+                vertices[tri[1]].tolist(),
+                vertices[tri[2]].tolist()
+            ])
+
+            value = float(stress[i])
+
+            sampled_stress.extend([
+                value,
+                value,
+                value
+            ])
+
+        return {
+            "vertices": [
+                [
+                    round(float(v[0]), 2),
+                    round(float(v[1]), 2),
+                    round(float(v[2]), 2)
+                ]
+                for v in sampled_vertices
+            ],
+
+            "stress": [
+                round(float(x), 3)
+                for x in sampled_stress
+            ]
+        }
+
+    # ==========================================================
+    # OPTIMIZATION PROFILES
+    # ==========================================================
+
+    def generate_profiles(
+        self,
+        volume_mm3,
+        support_risk,
+        dimensions
     ):
-        result["outdoor"] = True
 
-    # --------------------------------------------------------
-    # Mechanical loading
-    # --------------------------------------------------------
-
-    if "vibration" in text_lower:
-        result["vibration"] = True
-
-    if (
-        "cantilever" in text_lower
-        or "cantilevered" in text_lower
-    ):
-        result["cantilever"] = True
-
-    # --------------------------------------------------------
-    # Load
-    # --------------------------------------------------------
-
-    match = re.search(
-        r"(\d+(?:\.\d+)?)\s*(kg|kilogram|kilograms)",
-        text_lower
-    )
-
-    if match:
-        result["load_kg"] = float(match.group(1))
-
-    return result
-
-
-# ============================================================
-# STRENGTH HEURISTIC
-# ============================================================
-
-def estimate_strength_confidence(
-    geometry,
-    intent,
-    infill_percent,
-    wall_count
-):
-    """
-    This is NOT FEA.
-
-    It is an MVP confidence heuristic that gives us a useful
-    product demo while we build the real physics layer.
-    """
-
-    score = 50.0
-
-    # More walls generally improve robustness.
-    score += min(wall_count * 5, 20)
-
-    # More infill generally improves bulk strength.
-    score += min(infill_percent * 0.35, 20)
-
-    # Thin geometry reduces confidence.
-    if geometry["thin_feature_warning"]:
-        score -= 15
-
-    # Large support/overhang problems reduce confidence.
-    score -= geometry["support_risk"] * 0.15
-
-    # Strength-priority jobs should select more conservative
-    # configurations.
-    if intent["strength_priority"]:
-        score += 8
-
-    return clamp(score, 0, 99)
-
-
-# ============================================================
-# PRINT ESTIMATION
-# ============================================================
-
-def estimate_print(
-    volume_mm3,
-    infill_percent,
-    wall_count,
-    support_risk,
-    printer_speed_factor=1.0
-):
-    """
-    Rough planning estimate.
-
-    This is NOT a replacement for OrcaSlicer's actual slicer
-    time estimate.
-    """
-
-    # Convert mm³ to cm³.
-    solid_volume_cm3 = volume_mm3 / 1000.0
-
-    # Crude material utilization estimate.
-    utilization = (
-        0.18
-        + infill_percent / 100.0 * 0.55
-        + wall_count * 0.035
-    )
-
-    utilization = clamp(utilization, 0.18, 0.95)
-
-    printed_volume = solid_volume_cm3 * utilization
-
-    # Very rough print throughput assumption.
-    cm3_per_hour = 7.0 * printer_speed_factor
-
-    hours = printed_volume / cm3_per_hour
-
-    # Support penalty.
-    hours *= 1 + support_risk / 250
-
-    grams = printed_volume * 1.24
-
-    return {
-        "material_g": grams,
-        "time_hours": hours,
-    }
-
-
-# ============================================================
-# OPTIMIZATION OPTIONS
-# ============================================================
-
-def generate_options(geometry, intent):
-    """
-    Generate Eco / Balanced / Strength candidates.
-    """
-
-    # ----------------------------------------
-    # ECO
-    # ----------------------------------------
-
-    eco_walls = 2
-    eco_infill = 12
-
-    # ----------------------------------------
-    # BALANCED
-    # ----------------------------------------
-
-    balanced_walls = 3
-    balanced_infill = 25
-
-    # ----------------------------------------
-    # STRENGTH
-    # ----------------------------------------
-
-    strength_walls = 5
-    strength_infill = 45
-
-    if intent["strength_priority"]:
-
-        strength_walls = 6
-        strength_infill = 55
-
-        balanced_walls = 4
-        balanced_infill = 30
-
-    options = []
-
-    configs = [
-        (
-            "Eco",
-            eco_walls,
-            eco_infill,
-            "Minimize material and print time"
-        ),
-        (
-            "Balanced",
-            balanced_walls,
-            balanced_infill,
-            "Balance strength, material, and time"
-        ),
-        (
-            "Maximum Strength",
-            strength_walls,
-            strength_infill,
-            "Prioritize structural robustness"
-        ),
-    ]
-
-    for name, walls, infill, description in configs:
-
-        estimate = estimate_print(
-            geometry["volume_mm3"],
-            infill,
-            walls,
-            geometry["support_risk"]
-        )
-
-        confidence = estimate_strength_confidence(
-            geometry,
-            intent,
-            infill,
-            walls
-        )
-
-        # Energy proxy:
+        # Convert approximate plastic volume to grams.
         #
-        # This is an estimate, not a measurement.
-        # Later we'll replace this with real power data.
-        energy_kwh = (
-            estimate["time_hours"] * 0.12
+        # This is intentionally an estimate.
+        # Later we should use actual filament density.
+        base_material_g = (
+            volume_mm3
+            / 1000.0
+            * 0.00124
         )
 
-        co2e = energy_kwh * 0.35
+        complexity_factor = (
+            1.0
+            + support_risk / 200.0
+        )
 
-        options.append({
-            "name": name,
-            "walls": walls,
-            "infill": infill,
-            "description": description,
-            "material_g": estimate["material_g"],
-            "time_hours": estimate["time_hours"],
-            "energy_kwh": energy_kwh,
-            "co2e_kg": co2e,
-            "strength_confidence": confidence,
+        base_material_g *= complexity_factor
+
+        base_time = (
+            0.25
+            + volume_mm3 / 250000.0
+        )
+
+        base_time *= (
+            1.0
+            + support_risk / 150.0
+        )
+
+        profiles = []
+
+        definitions = [
+            (
+                "eco",
+                "Eco",
+                "MINIMUM RESOURCE",
+                2,
+                12,
+                0.72,
+                0.71
+            ),
+
+            (
+                "balanced",
+                "Balanced",
+                "RECOMMENDED",
+                4,
+                30,
+                1.00,
+                0.87
+            ),
+
+            (
+                "maximum",
+                "Maximum Strength",
+                "STRUCTURAL",
+                6,
+                55,
+                1.43,
+                0.96
+            )
+        ]
+
+        for (
+            profile_id,
+            name,
+            tag,
+            walls,
+            infill,
+            multiplier,
+            confidence
+        ) in definitions:
+
+            material = (
+                base_material_g
+                * multiplier
+            )
+
+            time_hours = (
+                base_time
+                * multiplier
+            )
+
+            energy = (
+                time_hours
+                * 0.12
+            )
+
+            co2 = (
+                energy
+                * 0.38
+            )
+
+            profiles.append({
+                "id": profile_id,
+                "name": name,
+                "tag": tag,
+                "walls": walls,
+                "infill": infill,
+                "material_g": round(
+                    material,
+                    2
+                ),
+                "time_h": round(
+                    time_hours,
+                    2
+                ),
+                "energy_kwh": round(
+                    energy,
+                    2
+                ),
+                "co2_kg": round(
+                    co2,
+                    3
+                ),
+                "confidence": round(
+                    confidence * 100
+                )
+            })
+
+        return profiles
+
+    # ==========================================================
+    # EXPLANATION ENGINE
+    # ==========================================================
+
+    def generate_changes(
+        self,
+        support_risk,
+        stress
+    ):
+
+        changes = []
+
+        if stress.max() > 0.8:
+
+            changes.append({
+                "severity": "critical",
+                "title": "Reinforce high-stress regions",
+
+                "body":
+                    "EcoSlice identifies localized regions "
+                    "that may benefit from additional wall "
+                    "thickness or density."
+            })
+
+        if support_risk > 10:
+
+            changes.append({
+                "severity": "medium",
+                "title": "Localize support material",
+
+                "body":
+                    "Only downward-facing regions above "
+                    "the overhang threshold are candidates "
+                    "for support."
+            })
+
+        changes.append({
+            "severity": "medium",
+            "title": "Use adaptive infill",
+
+            "body":
+                "Instead of applying one infill density "
+                "to the entire model, EcoSlice recommends "
+                "higher density near important load paths."
         })
 
-    return options
+        changes.append({
+            "severity": "low",
+            "title": "Optimize print orientation",
+
+            "body":
+                "EcoSlice can compare candidate orientations "
+                "using overhang risk, support volume, and "
+                "estimated print time."
+        })
+
+        return changes
 
 
 # ============================================================
-# FULL MODEL ANALYSIS
+# HTML UI
 # ============================================================
 
-def analyze_model(model, intent_text):
-    intent = parse_intent(intent_text)
-
-    objects = model.objects()
-
-    all_geometry = []
-
-    for obj in objects:
-
-        for volume in obj.volumes():
-
-            mesh = volume.mesh()
-
-            if mesh.is_empty():
-                continue
-
-            analysis = analyze_mesh(mesh)
-
-            analysis["object_name"] = obj.name
-
-            all_geometry.append(analysis)
-
-    if not all_geometry:
-        raise RuntimeError(
-            "No printable mesh was found in the current model."
-        )
-
-    total_volume = sum(
-        item["volume_mm3"]
-        for item in all_geometry
-    )
-
-    total_triangles = sum(
-        item["triangles"]
-        for item in all_geometry
-    )
-
-    total_surface = sum(
-        item["surface_area_mm2"]
-        for item in all_geometry
-    )
-
-    total_overhang = sum(
-        item["critical_overhang_area_mm2"]
-        for item in all_geometry
-    )
-
-    overall_geometry = {
-        "volume_mm3": total_volume,
-        "triangles": total_triangles,
-        "surface_area_mm2": total_surface,
-        "critical_overhang_area_mm2": total_overhang,
-        "support_risk": (
-            total_overhang / total_surface * 100
-            if total_surface > 0
-            else 0
-        ),
-        "thin_feature_warning": any(
-            item["thin_feature_warning"]
-            for item in all_geometry
-        ),
-    }
-
-    options = generate_options(
-        overall_geometry,
-        intent
-    )
-
-    return {
-        "objects": all_geometry,
-        "geometry": overall_geometry,
-        "intent": intent,
-        "options": options,
-    }
-
-
-# ============================================================
-# HTML DASHBOARD
-# ============================================================
-
-HTML = r"""
+PAGE = r"""
 <!DOCTYPE html>
 
 <html>
 
 <head>
 
-<meta charset="UTF-8">
+<meta charset="utf-8">
 
 <style>
 
-body {
-    font-family: var(--orca-font);
-    margin: 0;
-    padding: 20px;
-    color: var(--orca-fg);
-    background: var(--orca-bg);
-}
-
-h1 {
-    margin-top: 0;
-}
-
-.subtitle {
-    color: var(--orca-muted);
-    margin-bottom: 20px;
-}
-
-textarea {
-    width: 100%;
-    height: 90px;
+* {
     box-sizing: border-box;
-    resize: vertical;
+}
+
+body {
+    margin: 0;
+    font-family:
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
+
+    background:
+        #071216;
+
+    color: #e8f7f4;
+
+    overflow: hidden;
+}
+
+button,
+textarea,
+select {
+    font-family: inherit;
 }
 
 button {
-    padding: 10px 16px;
-    margin-top: 10px;
     cursor: pointer;
 }
 
-.grid {
+#app {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 12px;
-    margin-top: 20px;
+
+    grid-template-columns:
+        215px
+        1fr;
+
+    height: 100vh;
 }
 
-.card {
-    border: 1px solid var(--orca-border);
-    border-radius: 10px;
-    padding: 15px;
+/* =========================================================
+   SIDEBAR
+   ========================================================= */
+
+.sidebar {
+
+    border-right:
+        1px solid
+        rgba(255,255,255,.08);
+
+    padding: 24px 16px;
+
+    background:
+        #061014;
 }
 
-.card h3 {
-    margin-top: 0;
+.logo {
+
+    display: flex;
+
+    align-items: center;
+
+    gap: 10px;
+
+    margin-bottom: 32px;
 }
 
-.metric {
-    margin: 8px 0;
+.logo-mark {
+
+    width: 38px;
+    height: 38px;
+
+    border-radius: 12px;
+
+    display: flex;
+
+    align-items: center;
+    justify-content: center;
+
+    background:
+        #3dd9b5;
+
+    color: #03100e;
+
+    font-weight: 900;
 }
 
-.big {
-    font-size: 26px;
-    font-weight: bold;
+.logo-name {
+
+    font-weight: 800;
+    font-size: 18px;
 }
 
-.warning {
+.logo-sub {
+
+    color: #6d8985;
+
+    font-size: 10px;
+
+    margin-top: 2px;
+}
+
+.nav {
+
+    display: flex;
+
+    flex-direction: column;
+
+    gap: 8px;
+}
+
+.nav-item {
+
     padding: 12px;
-    border: 1px solid var(--orca-border);
-    border-radius: 8px;
-    margin-top: 15px;
-}
 
-.option {
-    border: 1px solid var(--orca-border);
     border-radius: 10px;
-    padding: 16px;
-}
 
-.selected {
-    border: 2px solid var(--orca-accent);
-}
+    color: #718984;
 
-.small {
-    color: var(--orca-muted);
     font-size: 13px;
 }
 
-.hidden {
-    display: none;
+.nav-item.active {
+
+    background:
+        rgba(61,217,181,.10);
+
+    color:
+        #3dd9b5;
+
+    border:
+        1px solid
+        rgba(61,217,181,.15);
+}
+
+.sidebar-bottom {
+
+    position: absolute;
+
+    bottom: 20px;
+
+    left: 16px;
+
+    color: #607773;
+
+    font-size: 11px;
+}
+
+/* =========================================================
+   MAIN
+   ========================================================= */
+
+.main {
+
+    display: flex;
+
+    flex-direction: column;
+
+    min-width: 0;
+}
+
+.topbar {
+
+    height: 66px;
+
+    border-bottom:
+        1px solid
+        rgba(255,255,255,.07);
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: space-between;
+
+    padding: 0 24px;
+}
+
+.page-title {
+
+    font-size: 14px;
+
+    font-weight: 700;
+}
+
+.status {
+
+    display: flex;
+
+    align-items: center;
+
+    gap: 8px;
+
+    font-size: 11px;
+
+    color: #7f9995;
+}
+
+.status-dot {
+
+    width: 7px;
+    height: 7px;
+
+    border-radius: 50%;
+
+    background: #3dd9b5;
+}
+
+/* =========================================================
+   CONTENT
+   ========================================================= */
+
+.content {
+
+    flex: 1;
+
+    display: grid;
+
+    grid-template-columns:
+        minmax(450px, 1fr)
+        390px;
+
+    gap: 16px;
+
+    padding: 16px;
+
+    min-height: 0;
+}
+
+/* =========================================================
+   MODEL
+   ========================================================= */
+
+.model-panel {
+
+    position: relative;
+
+    min-width: 0;
+
+    min-height: 0;
+
+    background:
+        #09181d;
+
+    border:
+        1px solid
+        rgba(255,255,255,.08);
+
+    border-radius: 16px;
+
+    overflow: hidden;
+}
+
+.model-header {
+
+    height: 58px;
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: space-between;
+
+    padding: 0 18px;
+
+    border-bottom:
+        1px solid
+        rgba(255,255,255,.06);
+}
+
+.model-name {
+
+    font-weight: 700;
+}
+
+.model-sub {
+
+    font-size: 10px;
+
+    color: #66817d;
+
+    margin-top: 3px;
+}
+
+.mode-buttons {
+
+    display: flex;
+
+    gap: 5px;
+}
+
+.mode {
+
+    border:
+        1px solid
+        rgba(255,255,255,.09);
+
+    background:
+        rgba(255,255,255,.03);
+
+    color: #78918d;
+
+    padding:
+        7px 10px;
+
+    border-radius: 7px;
+
+    font-size: 10px;
+}
+
+.mode.active {
+
+    color: #3dd9b5;
+
+    border-color:
+        rgba(61,217,181,.35);
+
+    background:
+        rgba(61,217,181,.08);
+}
+
+#viewport {
+
+    position: absolute;
+
+    top: 58px;
+    bottom: 92px;
+
+    left: 0;
+    right: 0;
+
+    overflow: hidden;
+
+    background:
+        radial-gradient(
+            circle at 50% 45%,
+            rgba(34,101,104,.28),
+            transparent 55%
+        );
+}
+
+#canvas {
+
+    width: 100%;
+    height: 100%;
+
+    display: block;
+}
+
+.viewport-hint {
+
+    position: absolute;
+
+    left: 16px;
+    bottom: 104px;
+
+    color: #607d78;
+
+    font-size: 10px;
+}
+
+/* =========================================================
+   MODEL STATS
+   ========================================================= */
+
+.model-stats {
+
+    position: absolute;
+
+    bottom: 0;
+
+    left: 0;
+    right: 0;
+
+    height: 92px;
+
+    display: grid;
+
+    grid-template-columns:
+        repeat(4,1fr);
+
+    border-top:
+        1px solid
+        rgba(255,255,255,.07);
+
+    background:
+        rgba(5,16,20,.96);
+}
+
+.stat {
+
+    padding:
+        18px;
+
+    border-right:
+        1px solid
+        rgba(255,255,255,.06);
+}
+
+.stat-label {
+
+    font-size: 9px;
+
+    color: #5f7774;
+
+    text-transform:
+        uppercase;
+
+    letter-spacing:
+        .08em;
+}
+
+.stat-value {
+
+    margin-top: 7px;
+
+    font-size: 13px;
+
+    font-weight: 700;
+}
+
+/* =========================================================
+   RIGHT PANEL
+   ========================================================= */
+
+.right {
+
+    overflow-y: auto;
+
+    padding-right: 2px;
+}
+
+.card {
+
+    background:
+        #0b1b20;
+
+    border:
+        1px solid
+        rgba(255,255,255,.08);
+
+    border-radius: 14px;
+
+    padding: 16px;
+
+    margin-bottom: 12px;
+}
+
+.eyebrow {
+
+    font-size: 9px;
+
+    color: #3dd9b5;
+
+    font-weight: 800;
+
+    letter-spacing:
+        .14em;
+
+    text-transform:
+        uppercase;
+}
+
+h2 {
+
+    margin:
+        6px 0 6px;
+
+    font-size: 18px;
+}
+
+.description {
+
+    color: #78918d;
+
+    font-size: 11px;
+
+    line-height: 1.5;
+
+    margin-bottom: 12px;
+}
+
+textarea {
+
+    width: 100%;
+
+    height: 95px;
+
+    resize: none;
+
+    border:
+        1px solid
+        rgba(255,255,255,.08);
+
+    border-radius: 10px;
+
+    background:
+        #071318;
+
+    color: #d9eeea;
+
+    padding: 12px;
+
+    outline: none;
+
+    font-size: 11px;
+}
+
+textarea:focus {
+
+    border-color:
+        rgba(61,217,181,.5);
+}
+
+.primary {
+
+    width: 100%;
+
+    margin-top: 10px;
+
+    border: none;
+
+    border-radius: 10px;
+
+    padding: 13px;
+
+    background:
+        linear-gradient(
+            135deg,
+            #3dd9b5,
+            #55d6e5
+        );
+
+    color: #04100f;
+
+    font-weight: 900;
+
+    font-size: 12px;
+}
+
+/* =========================================================
+   ENGINEERING CONTROLS
+   ========================================================= */
+
+.section-title {
+
+    display: flex;
+
+    justify-content: space-between;
+
+    align-items: center;
+
+    margin-bottom: 12px;
+
+    font-size: 12px;
+
+    font-weight: 800;
+}
+
+.badge {
+
+    padding:
+        4px 7px;
+
+    border-radius: 6px;
+
+    font-size: 8px;
+
+    background:
+        rgba(61,217,181,.08);
+
+    color:
+        #3dd9b5;
+}
+
+.control {
+
+    display: flex;
+
+    justify-content: space-between;
+
+    align-items: center;
+
+    padding: 10px 0;
+
+    border-bottom:
+        1px solid
+        rgba(255,255,255,.05);
+}
+
+.control:last-child {
+
+    border-bottom: none;
+}
+
+.control-name {
+
+    font-size: 11px;
+}
+
+.control-value {
+
+    color: #718b87;
+
+    font-size: 10px;
+}
+
+/* =========================================================
+   PROFILE CARDS
+   ========================================================= */
+
+.profile {
+
+    border:
+        1px solid
+        rgba(255,255,255,.08);
+
+    border-radius: 11px;
+
+    padding: 12px;
+
+    margin-top: 8px;
+
+    background:
+        rgba(255,255,255,.015);
+}
+
+.profile.recommended {
+
+    border-color:
+        rgba(61,217,181,.38);
+
+    background:
+        rgba(61,217,181,.04);
+}
+
+.profile-top {
+
+    display: flex;
+
+    justify-content: space-between;
+
+    align-items: center;
+}
+
+.profile-name {
+
+    font-size: 13px;
+
+    font-weight: 800;
+}
+
+.profile-tag {
+
+    font-size: 8px;
+
+    color: #3dd9b5;
+
+    font-weight: 800;
+}
+
+.profile-description {
+
+    color: #718985;
+
+    font-size: 10px;
+
+    margin: 5px 0 10px;
+}
+
+.metrics {
+
+    display: grid;
+
+    grid-template-columns:
+        repeat(3,1fr);
+
+    gap: 6px;
+}
+
+.metric {
+
+    background:
+        #071318;
+
+    padding: 8px;
+
+    border-radius: 7px;
+}
+
+.metric-label {
+
+    font-size: 8px;
+
+    color: #58706d;
+}
+
+.metric-value {
+
+    margin-top: 4px;
+
+    font-size: 11px;
+
+    font-weight: 700;
+}
+
+.select-profile {
+
+    width: 100%;
+
+    margin-top: 9px;
+
+    padding: 8px;
+
+    border-radius: 7px;
+
+    background:
+        transparent;
+
+    color: #9db5b1;
+
+    border:
+        1px solid
+        rgba(255,255,255,.08);
+
+    font-size: 10px;
+}
+
+.profile.recommended
+.select-profile {
+
+    border-color:
+        rgba(61,217,181,.35);
+
+    color:
+        #3dd9b5;
+}
+
+/* =========================================================
+   CHANGES
+   ========================================================= */
+
+.change {
+
+    display: flex;
+
+    gap: 10px;
+
+    padding: 9px 0;
+
+    border-bottom:
+        1px solid
+        rgba(255,255,255,.05);
+}
+
+.change-dot {
+
+    width: 7px;
+    height: 7px;
+
+    border-radius: 50%;
+
+    margin-top: 4px;
+
+    flex-shrink: 0;
+}
+
+.change-dot.critical {
+
+    background: #ff756f;
+}
+
+.change-dot.medium {
+
+    background: #e8c95c;
+}
+
+.change-dot.low {
+
+    background: #3dd9b5;
+}
+
+.change-title {
+
+    font-size: 10px;
+
+    font-weight: 800;
+}
+
+.change-body {
+
+    margin-top: 3px;
+
+    color: #718984;
+
+    font-size: 9px;
+
+    line-height: 1.45;
+}
+
+/* =========================================================
+   SUPPORT LEGEND
+   ========================================================= */
+
+.legend {
+
+    display: flex;
+
+    gap: 14px;
+
+    font-size: 9px;
+
+    color: #6f8884;
+}
+
+.legend-item {
+
+    display: flex;
+
+    gap: 5px;
+
+    align-items: center;
+}
+
+.legend-dot {
+
+    width: 7px;
+    height: 7px;
+
+    border-radius: 50%;
 }
 
 </style>
@@ -624,399 +1491,1478 @@ button {
 
 <body>
 
-<h1>EcoSlice</h1>
+<div id="app">
 
-<div class="subtitle">
-AI-assisted material, energy, and strength optimization
-for functional 3D printing.
+    <aside class="sidebar">
+
+        <div class="logo">
+
+            <div class="logo-mark">
+                E
+            </div>
+
+            <div>
+                <div class="logo-name">
+                    EcoSlice
+                </div>
+
+                <div class="logo-sub">
+                    FUNCTIONAL PRINTING
+                </div>
+            </div>
+
+        </div>
+
+        <div class="nav">
+
+            <div class="nav-item active">
+                ◈ Workspace
+            </div>
+
+            <div class="nav-item">
+                ◇ Analysis
+            </div>
+
+            <div class="nav-item">
+                ◇ Compare
+            </div>
+
+            <div class="nav-item">
+                ◇ Validation
+            </div>
+
+        </div>
+
+        <div class="sidebar-bottom">
+
+            <div>
+                ● Prototype v0.2
+            </div>
+
+            <div style="margin-top:6px">
+                AI manufacturing copilot
+            </div>
+
+        </div>
+
+    </aside>
+
+
+    <main class="main">
+
+        <header class="topbar">
+
+            <div class="page-title">
+                EcoSlice Optimizer
+            </div>
+
+            <div class="status">
+
+                <span class="status-dot"></span>
+
+                Connected to OrcaSlicer
+
+            </div>
+
+        </header>
+
+
+        <div class="content">
+
+
+            <!-- ============================================
+                 MODEL VIEW
+                 ============================================ -->
+
+            <section class="model-panel">
+
+                <div class="model-header">
+
+                    <div>
+
+                        <div
+                            class="model-name"
+                            id="modelName"
+                        >
+                            Current OrcaSlicer Model
+                        </div>
+
+                        <div
+                            class="model-sub"
+                            id="modelSub"
+                        >
+                            Waiting for analysis
+                        </div>
+
+                    </div>
+
+
+                    <div class="mode-buttons">
+
+                        <button
+                            class="mode active"
+                            onclick="setMode('solid')"
+                        >
+                            Solid
+                        </button>
+
+                        <button
+                            class="mode"
+                            onclick="setMode('stress')"
+                        >
+                            Stress
+                        </button>
+
+                        <button
+                            class="mode"
+                            onclick="setMode('supports')"
+                        >
+                            Supports
+                        </button>
+
+                    </div>
+
+                </div>
+
+
+                <div id="viewport">
+
+                    <canvas id="canvas"></canvas>
+
+                    <div class="viewport-hint">
+
+                        Drag to rotate · Scroll to zoom
+
+                    </div>
+
+                </div>
+
+
+                <div class="model-stats">
+
+                    <div class="stat">
+
+                        <div class="stat-label">
+                            Dimensions
+                        </div>
+
+                        <div
+                            class="stat-value"
+                            id="dimensions"
+                        >
+                            —
+                        </div>
+
+                    </div>
+
+
+                    <div class="stat">
+
+                        <div class="stat-label">
+                            Volume
+                        </div>
+
+                        <div
+                            class="stat-value"
+                            id="volume"
+                        >
+                            —
+                        </div>
+
+                    </div>
+
+
+                    <div class="stat">
+
+                        <div class="stat-label">
+                            Triangles
+                        </div>
+
+                        <div
+                            class="stat-value"
+                            id="triangles"
+                        >
+                            —
+                        </div>
+
+                    </div>
+
+
+                    <div class="stat">
+
+                        <div class="stat-label">
+                            Support Risk
+                        </div>
+
+                        <div
+                            class="stat-value"
+                            id="supportRisk"
+                        >
+                            —
+                        </div>
+
+                    </div>
+
+                </div>
+
+            </section>
+
+
+            <!-- ============================================
+                 RIGHT SIDEBAR
+                 ============================================ -->
+
+            <section class="right">
+
+
+                <!-- INTENT -->
+
+                <div class="card">
+
+                    <div class="eyebrow">
+                        DESIGN INTENT
+                    </div>
+
+                    <h2>
+                        What does this part need to do?
+                    </h2>
+
+                    <div class="description">
+
+                        Describe the real-world job of the
+                        part. EcoSlice uses this to influence
+                        the optimization strategy.
+
+                    </div>
+
+                    <textarea
+                        id="intent"
+                        placeholder="Example: This is a bike-light mount attached to a tube. It carries a 1 kg light outdoors and experiences vibration while riding."
+                    ></textarea>
+
+                    <button
+                        class="primary"
+                        onclick="analyze()"
+                    >
+                        Analyze & Optimize
+                    </button>
+
+                </div>
+
+
+                <!-- ENGINEERING -->
+
+                <div class="card">
+
+                    <div class="section-title">
+
+                        <span>
+                            ENGINEERING ANALYSIS
+                        </span>
+
+                        <span class="badge">
+                            LIVE MODEL
+                        </span>
+
+                    </div>
+
+                    <div class="control">
+
+                        <span class="control-name">
+                            Overhang analysis
+                        </span>
+
+                        <span
+                            class="control-value"
+                            id="overhang"
+                        >
+                            —
+                        </span>
+
+                    </div>
+
+                    <div class="control">
+
+                        <span class="control-name">
+                            Stress map
+                        </span>
+
+                        <span
+                            class="control-value"
+                            id="stress"
+                        >
+                            —
+                        </span>
+
+                    </div>
+
+                    <div class="control">
+
+                        <span class="control-name">
+                            Support regions
+                        </span>
+
+                        <span
+                            class="control-value"
+                            id="supportCount"
+                        >
+                            —
+                        </span>
+
+                    </div>
+
+                    <div class="control">
+
+                        <span class="control-name">
+                            Watertight
+                        </span>
+
+                        <span
+                            class="control-value"
+                            id="watertight"
+                        >
+                            —
+                        </span>
+
+                    </div>
+
+                </div>
+
+
+                <!-- PROFILES -->
+
+                <div class="card">
+
+                    <div class="section-title">
+
+                        <span>
+                            OPTIMIZATION OPTIONS
+                        </span>
+
+                    </div>
+
+                    <div id="profiles">
+
+                        <div class="description">
+                            Analyze the model to generate
+                            optimization profiles.
+                        </div>
+
+                    </div>
+
+                </div>
+
+
+                <!-- CHANGES -->
+
+                <div class="card">
+
+                    <div class="section-title">
+
+                        <span>
+                            WHAT ECOSLICE WOULD CHANGE
+                        </span>
+
+                    </div>
+
+                    <div id="changes">
+
+                        <div class="description">
+                            No recommendations yet.
+                        </div>
+
+                    </div>
+
+                </div>
+
+
+                <!-- LEGEND -->
+
+                <div class="card">
+
+                    <div class="section-title">
+
+                        <span>
+                            VISUALIZATION
+                        </span>
+
+                    </div>
+
+                    <div class="legend">
+
+                        <div class="legend-item">
+
+                            <span
+                                class="legend-dot"
+                                style="background:#3dd9b5"
+                            ></span>
+
+                            Lower stress
+
+                        </div>
+
+                        <div class="legend-item">
+
+                            <span
+                                class="legend-dot"
+                                style="background:#e8c95c"
+                            ></span>
+
+                            Medium
+
+                        </div>
+
+                        <div class="legend-item">
+
+                            <span
+                                class="legend-dot"
+                                style="background:#ff756f"
+                            ></span>
+
+                            Higher stress
+
+                        </div>
+
+                    </div>
+
+                </div>
+
+
+            </section>
+
+        </div>
+
+    </main>
+
 </div>
 
-<h2>1. Describe the part</h2>
-
-<textarea id="intent"
-placeholder="Example: A garden hose holder. It supports 1 kg outdoors. Strength matters more than appearance."></textarea>
-
-<br>
-
-<button onclick="analyze()">
-Analyze current OrcaSlicer model
-</button>
-
-<div id="status"></div>
-
-<div id="results" class="hidden">
-
-<h2>2. Geometry</h2>
-
-<div class="grid">
-
-<div class="card">
-<div class="small">Volume</div>
-<div class="big" id="volume"></div>
-</div>
-
-<div class="card">
-<div class="small">Triangles</div>
-<div class="big" id="triangles"></div>
-</div>
-
-<div class="card">
-<div class="small">Support Risk</div>
-<div class="big" id="risk"></div>
-</div>
-
-</div>
-
-<div id="warnings"></div>
-
-<h2>3. Engineering Intent</h2>
-
-<div class="card">
-
-<div>
-Priority:
-<strong id="priority"></strong>
-</div>
-
-<div>
-Load:
-<strong id="load"></strong>
-</div>
-
-<div>
-Outdoor:
-<strong id="outdoor"></strong>
-</div>
-
-<div>
-Vibration:
-<strong id="vibration"></strong>
-</div>
-
-</div>
-
-<h2>4. Optimization Options</h2>
-
-<div class="grid" id="options"></div>
-
-<h2>5. What EcoSlice would change</h2>
-
-<div class="card" id="explanation"></div>
-
-</div>
 
 <script>
 
-function post(type, payload = {}) {
+/* ==========================================================
+   STATE
+   ========================================================== */
 
-    window.orca.postMessage({
-        type: type,
-        ...payload
-    });
+let DATA = null;
+
+let MODE = "solid";
+
+let rotationX = -0.45;
+let rotationY = 0.65;
+
+let zoom = 1;
+
+let dragging = false;
+
+let lastMouseX = 0;
+let lastMouseY = 0;
+
+
+/* ==========================================================
+   CANVAS
+   ========================================================== */
+
+const canvas =
+    document.getElementById("canvas");
+
+const ctx =
+    canvas.getContext("2d");
+
+
+function resizeCanvas() {
+
+    const rect =
+        canvas.getBoundingClientRect();
+
+    canvas.width =
+        Math.max(1, rect.width * devicePixelRatio);
+
+    canvas.height =
+        Math.max(1, rect.height * devicePixelRatio);
+
+    ctx.setTransform(
+        devicePixelRatio,
+        0,
+        0,
+        devicePixelRatio,
+        0,
+        0
+    );
+
+    draw();
 
 }
+
+
+window.addEventListener(
+    "resize",
+    resizeCanvas
+);
+
+
+resizeCanvas();
+
+
+/* ==========================================================
+   MOUSE ROTATION
+   ========================================================== */
+
+canvas.addEventListener(
+    "mousedown",
+    function(event) {
+
+        dragging = true;
+
+        lastMouseX =
+            event.clientX;
+
+        lastMouseY =
+            event.clientY;
+
+    }
+);
+
+
+window.addEventListener(
+    "mouseup",
+    function() {
+
+        dragging = false;
+
+    }
+);
+
+
+window.addEventListener(
+    "mousemove",
+    function(event) {
+
+        if (!dragging)
+            return;
+
+        const dx =
+            event.clientX - lastMouseX;
+
+        const dy =
+            event.clientY - lastMouseY;
+
+        rotationY += dx * 0.01;
+
+        rotationX += dy * 0.01;
+
+        lastMouseX =
+            event.clientX;
+
+        lastMouseY =
+            event.clientY;
+
+        draw();
+
+    }
+);
+
+
+canvas.addEventListener(
+    "wheel",
+    function(event) {
+
+        event.preventDefault();
+
+        zoom *=
+            event.deltaY > 0
+                ? 0.9
+                : 1.1;
+
+        zoom =
+            Math.max(
+                0.4,
+                Math.min(4, zoom)
+            );
+
+        draw();
+
+    },
+    { passive:false }
+);
+
+
+/* ==========================================================
+   MODE
+   ========================================================== */
+
+function setMode(mode) {
+
+    MODE = mode;
+
+    document
+        .querySelectorAll(".mode")
+        .forEach(
+            button =>
+                button.classList.remove("active")
+        );
+
+    event.target.classList.add("active");
+
+    draw();
+
+}
+
+
+/* ==========================================================
+   ROTATION
+   ========================================================== */
+
+function rotatePoint(point) {
+
+    let [x,y,z] = point;
+
+    // X rotation
+
+    let cosX =
+        Math.cos(rotationX);
+
+    let sinX =
+        Math.sin(rotationX);
+
+    let y1 =
+        y * cosX - z * sinX;
+
+    let z1 =
+        y * sinX + z * cosX;
+
+    y = y1;
+    z = z1;
+
+    // Y rotation
+
+    let cosY =
+        Math.cos(rotationY);
+
+    let sinY =
+        Math.sin(rotationY);
+
+    let x1 =
+        x * cosY + z * sinY;
+
+    let z2 =
+        -x * sinY + z * cosY;
+
+    x = x1;
+    z = z2;
+
+    return [x,y,z];
+
+}
+
+
+/* ==========================================================
+   DRAW MODEL
+   ========================================================== */
+
+function draw() {
+
+    const rect =
+        canvas.getBoundingClientRect();
+
+    const width =
+        rect.width;
+
+    const height =
+        rect.height;
+
+    ctx.clearRect(
+        0,
+        0,
+        width,
+        height
+    );
+
+    if (!DATA ||
+        !DATA.mesh ||
+        !DATA.mesh.vertices.length) {
+
+        drawEmptyState();
+
+        return;
+    }
+
+    const vertices =
+        DATA.mesh.vertices;
+
+    const stresses =
+        DATA.mesh.stress;
+
+    let points =
+        vertices.map(
+            rotatePoint
+        );
+
+    let maxDimension = 1;
+
+    points.forEach(
+        p => {
+
+            maxDimension =
+                Math.max(
+                    maxDimension,
+                    Math.abs(p[0]),
+                    Math.abs(p[1]),
+                    Math.abs(p[2])
+                );
+
+        }
+    );
+
+    const scale =
+        Math.min(width,height)
+        / (maxDimension * 2.5)
+        * zoom;
+
+    function project(p) {
+
+        return [
+            width / 2 + p[0] * scale,
+            height / 2 - p[1] * scale
+        ];
+
+    }
+
+
+    // ------------------------------------------------------
+    // Draw grid
+    // ------------------------------------------------------
+
+    ctx.save();
+
+    ctx.strokeStyle =
+        "rgba(61,217,181,.08)";
+
+    ctx.lineWidth = 1;
+
+    const gridSize = 50;
+
+    for (
+        let x = 0;
+        x < width;
+        x += gridSize
+    ) {
+
+        ctx.beginPath();
+
+        ctx.moveTo(x,0);
+
+        ctx.lineTo(x,height);
+
+        ctx.stroke();
+
+    }
+
+    for (
+        let y = 0;
+        y < height;
+        y += gridSize
+    ) {
+
+        ctx.beginPath();
+
+        ctx.moveTo(0,y);
+
+        ctx.lineTo(width,y);
+
+        ctx.stroke();
+
+    }
+
+    ctx.restore();
+
+
+    // ------------------------------------------------------
+    // Draw triangles
+    // ------------------------------------------------------
+
+    for (
+        let i = 0;
+        i < vertices.length;
+        i += 3
+    ) {
+
+        if (
+            i + 2 >= vertices.length
+        )
+            break;
+
+        const p1 =
+            project(points[i]);
+
+        const p2 =
+            project(points[i + 1]);
+
+        const p3 =
+            project(points[i + 2]);
+
+
+        let color =
+            "rgba(55,116,121,.60)";
+
+
+        if (MODE === "stress") {
+
+            const stress =
+                stresses[i] || 0;
+
+            color =
+                stressColor(
+                    stress
+                );
+
+        }
+
+
+        ctx.beginPath();
+
+        ctx.moveTo(
+            p1[0],
+            p1[1]
+        );
+
+        ctx.lineTo(
+            p2[0],
+            p2[1]
+        );
+
+        ctx.lineTo(
+            p3[0],
+            p3[1]
+        );
+
+        ctx.closePath();
+
+        ctx.fillStyle =
+            color;
+
+        ctx.fill();
+
+
+        ctx.strokeStyle =
+            "rgba(110,220,220,.08)";
+
+        ctx.stroke();
+
+    }
+
+
+    // ------------------------------------------------------
+    // SUPPORTS
+    // ------------------------------------------------------
+
+    if (
+        MODE === "supports"
+        &&
+        DATA.supports
+    ) {
+
+        DATA.supports.forEach(
+            support => {
+
+                const top =
+                    project(
+                        rotatePoint(
+                            support.top
+                        )
+                    );
+
+                const bottom =
+                    project(
+                        rotatePoint(
+                            support.bottom
+                        )
+                    );
+
+                ctx.strokeStyle =
+                    "#f4d34f";
+
+                ctx.lineWidth = 3;
+
+                ctx.beginPath();
+
+                ctx.moveTo(
+                    top[0],
+                    top[1]
+                );
+
+                ctx.lineTo(
+                    bottom[0],
+                    bottom[1]
+                );
+
+                ctx.stroke();
+
+
+                ctx.fillStyle =
+                    "#f4d34f";
+
+                ctx.beginPath();
+
+                ctx.arc(
+                    top[0],
+                    top[1],
+                    3,
+                    0,
+                    Math.PI * 2
+                );
+
+                ctx.fill();
+
+            }
+        );
+
+    }
+
+}
+
+
+/* ==========================================================
+   STRESS COLOR
+   ========================================================== */
+
+function stressColor(value) {
+
+    value =
+        Math.max(
+            0,
+            Math.min(
+                1,
+                value
+            )
+        );
+
+    if (value < 0.5) {
+
+        const t =
+            value * 2;
+
+        return `
+            rgb(
+                ${Math.round(61 + 180*t)},
+                ${Math.round(217 - 80*t)},
+                ${Math.round(181 - 110*t)}
+            )
+        `;
+
+    }
+
+    const t =
+        (value - 0.5) * 2;
+
+    return `
+        rgb(
+            ${Math.round(241)},
+            ${Math.round(137 - 60*t)},
+            ${Math.round(101 - 70*t)}
+        )
+    `;
+
+}
+
+
+/* ==========================================================
+   EMPTY
+   ========================================================== */
+
+function drawEmptyState() {
+
+    const rect =
+        canvas.getBoundingClientRect();
+
+    const width =
+        rect.width;
+
+    const height =
+        rect.height;
+
+    ctx.textAlign =
+        "center";
+
+    ctx.fillStyle =
+        "#54706d";
+
+    ctx.font =
+        "14px sans-serif";
+
+    ctx.fillText(
+        "Load a model in OrcaSlicer",
+        width / 2,
+        height / 2
+    );
+
+}
+
+
+/* ==========================================================
+   UPDATE UI
+   ========================================================== */
+
+function updateUI(data) {
+
+    DATA = data;
+
+    const geometry =
+        data.geometry;
+
+    document.getElementById(
+        "dimensions"
+    ).textContent =
+        geometry.dimensions_mm
+            .map(
+                x => x.toFixed(1)
+            )
+            .join(" × ")
+        + " mm";
+
+
+    document.getElementById(
+        "volume"
+    ).textContent =
+        geometry.volume_mm3.toLocaleString()
+        + " mm³";
+
+
+    document.getElementById(
+        "triangles"
+    ).textContent =
+        geometry.triangles.toLocaleString();
+
+
+    document.getElementById(
+        "supportRisk"
+    ).textContent =
+        geometry.support_risk
+        + "%";
+
+
+    document.getElementById(
+        "modelName"
+    ).textContent =
+        data.objects?.[0]?.name
+        || "Current OrcaSlicer Model";
+
+
+    document.getElementById(
+        "modelSub"
+    ).textContent =
+        "EcoSlice analysis complete";
+
+
+    document.getElementById(
+        "overhang"
+    ).textContent =
+        data.analysis.overhang_faces.toLocaleString()
+        + " faces";
+
+
+    document.getElementById(
+        "stress"
+    ).textContent =
+        Math.round(
+            data.analysis.stress_max * 100
+        )
+        + "% max";
+
+
+    document.getElementById(
+        "supportCount"
+    ).textContent =
+        data.analysis.support_points
+        + " regions";
+
+
+    document.getElementById(
+        "watertight"
+    ).textContent =
+        geometry.manifold
+            ? "YES"
+            : "NO";
+
+
+    renderProfiles(
+        data.profiles
+    );
+
+
+    renderChanges(
+        data.changes
+    );
+
+
+    draw();
+
+}
+
+
+/* ==========================================================
+   PROFILES
+   ========================================================== */
+
+function renderProfiles(
+    profiles
+) {
+
+    const container =
+        document.getElementById(
+            "profiles"
+        );
+
+    container.innerHTML = "";
+
+    profiles.forEach(
+        profile => {
+
+            const recommended =
+                profile.id === "balanced";
+
+            const card =
+                document.createElement(
+                    "div"
+                );
+
+            card.className =
+                "profile"
+                + (
+                    recommended
+                        ? " recommended"
+                        : ""
+                );
+
+
+            card.innerHTML = `
+
+                <div class="profile-top">
+
+                    <div class="profile-name">
+                        ${profile.name}
+                    </div>
+
+                    <div class="profile-tag">
+                        ${profile.tag}
+                    </div>
+
+                </div>
+
+                <div class="profile-description">
+
+                    ${
+                        profile.id === "eco"
+                        ? "Minimize material and print time."
+                        : profile.id === "balanced"
+                        ? "Balance strength, material, and time."
+                        : "Prioritize structural robustness."
+                    }
+
+                </div>
+
+                <div class="metrics">
+
+                    <div class="metric">
+
+                        <div class="metric-label">
+                            MATERIAL
+                        </div>
+
+                        <div class="metric-value">
+                            ${profile.material_g} g
+                        </div>
+
+                    </div>
+
+                    <div class="metric">
+
+                        <div class="metric-label">
+                            TIME
+                        </div>
+
+                        <div class="metric-value">
+                            ${profile.time_h} h
+                        </div>
+
+                    </div>
+
+                    <div class="metric">
+
+                        <div class="metric-label">
+                            ENERGY
+                        </div>
+
+                        <div class="metric-value">
+                            ${profile.energy_kwh} kWh
+                        </div>
+
+                    </div>
+
+                    <div class="metric">
+
+                        <div class="metric-label">
+                            CO₂e
+                        </div>
+
+                        <div class="metric-value">
+                            ${profile.co2_kg} kg
+                        </div>
+
+                    </div>
+
+                    <div class="metric">
+
+                        <div class="metric-label">
+                            WALLS
+                        </div>
+
+                        <div class="metric-value">
+                            ${profile.walls}
+                        </div>
+
+                    </div>
+
+                    <div class="metric">
+
+                        <div class="metric-label">
+                            INFILL
+                        </div>
+
+                        <div class="metric-value">
+                            ${profile.infill}%
+                        </div>
+
+                    </div>
+
+                </div>
+
+                <div class="metric" style="margin-top:7px">
+
+                    <div class="metric-label">
+                        STRENGTH CONFIDENCE
+                    </div>
+
+                    <div class="metric-value">
+                        ${profile.confidence}%
+                    </div>
+
+                </div>
+
+                <button
+                    class="select-profile"
+                    onclick="selectProfile('${profile.id}')"
+                >
+                    ${
+                        recommended
+                        ? "Recommended"
+                        : "Select"
+                    }
+                </button>
+
+            `;
+
+            container.appendChild(
+                card
+            );
+
+        }
+    );
+
+}
+
+
+/* ==========================================================
+   CHANGES
+   ========================================================== */
+
+function renderChanges(
+    changes
+) {
+
+    const container =
+        document.getElementById(
+            "changes"
+        );
+
+    container.innerHTML = "";
+
+    changes.forEach(
+        change => {
+
+            const row =
+                document.createElement(
+                    "div"
+                );
+
+            row.className =
+                "change";
+
+            row.innerHTML = `
+
+                <span
+                    class="change-dot ${change.severity}"
+                ></span>
+
+                <div>
+
+                    <div class="change-title">
+                        ${change.title}
+                    </div>
+
+                    <div class="change-body">
+                        ${change.body}
+                    </div>
+
+                </div>
+
+            `;
+
+            container.appendChild(
+                row
+            );
+
+        }
+    );
+
+}
+
+
+/* ==========================================================
+   ACTIONS
+   ========================================================== */
 
 function analyze() {
 
     const intent =
-        document.getElementById("intent").value;
+        document.getElementById(
+            "intent"
+        ).value;
 
-    document.getElementById("status").innerText =
-        "Analyzing model...";
 
-    post("analyze", {
-        intent: intent
-    });
+    if (
+        window.orca
+        &&
+        window.orca.postMessage
+    ) {
 
-}
+        window.orca.postMessage({
 
-function receive(data) {
+            type: "analyze",
 
-    if (data.type === "result") {
+            intent: intent
 
-        render(data.result);
-
-    }
-
-    if (data.type === "error") {
-
-        document.getElementById("status").innerText =
-            "Error: " + data.message;
+        });
 
     }
 
 }
 
-function render(result) {
 
-    document
-        .getElementById("results")
-        .classList
-        .remove("hidden");
+function selectProfile(
+    profileId
+) {
 
-    document.getElementById("status").innerText =
-        "Analysis complete.";
+    if (
+        window.orca
+        &&
+        window.orca.postMessage
+    ) {
 
-    document.getElementById("volume").innerText =
-        Math.round(
-            result.geometry.volume_mm3
-        ).toLocaleString() + " mm³";
+        window.orca.postMessage({
 
-    document.getElementById("triangles").innerText =
-        result.geometry.triangles.toLocaleString();
+            type: "select_profile",
 
-    document.getElementById("risk").innerText =
-        result.geometry.support_risk.toFixed(1) + "%";
+            profile:
+                profileId
 
-    document.getElementById("priority").innerText =
-        result.intent.priority;
-
-    document.getElementById("load").innerText =
-        result.intent.load_kg === null
-            ? "Not specified"
-            : result.intent.load_kg + " kg";
-
-    document.getElementById("outdoor").innerText =
-        result.intent.outdoor ? "Yes" : "No";
-
-    document.getElementById("vibration").innerText =
-        result.intent.vibration ? "Yes" : "No";
-
-    let warning = "";
-
-    if (result.geometry.support_risk > 50) {
-
-        warning += `
-        <div class="warning">
-        ⚠️ High support risk detected.
-        EcoSlice recommends evaluating orientation
-        before generating supports.
-        </div>
-        `;
+        });
 
     }
 
-    if (result.geometry.thin_feature_warning) {
-
-        warning += `
-        <div class="warning">
-        ⚠️ Thin geometry detected.
-        Consider additional walls or a stronger
-        orientation.
-        </div>
-        `;
-
-    }
-
-    document.getElementById("warnings").innerHTML =
-        warning;
-
-    const container =
-        document.getElementById("options");
-
-    container.innerHTML = "";
-
-    result.options.forEach((option, index) => {
-
-        const card =
-            document.createElement("div");
-
-        card.className = "option";
-
-        card.innerHTML = `
-
-        <h3>${option.name}</h3>
-
-        <div class="small">
-        ${option.description}
-        </div>
-
-        <div class="metric">
-        Walls:
-        <strong>${option.walls}</strong>
-        </div>
-
-        <div class="metric">
-        Infill:
-        <strong>${option.infill}%</strong>
-        </div>
-
-        <div class="metric">
-        Material:
-        <strong>
-        ${option.material_g.toFixed(1)} g
-        </strong>
-        </div>
-
-        <div class="metric">
-        Time:
-        <strong>
-        ${option.time_hours.toFixed(2)} h
-        </strong>
-        </div>
-
-        <div class="metric">
-        Energy:
-        <strong>
-        ${option.energy_kwh.toFixed(2)} kWh
-        </strong>
-        </div>
-
-        <div class="metric">
-        CO₂e proxy:
-        <strong>
-        ${option.co2e_kg.toFixed(2)} kg
-        </strong>
-        </div>
-
-        <div class="metric">
-        Strength confidence:
-        <strong>
-        ${option.strength_confidence.toFixed(0)}%
-        </strong>
-        </div>
-
-        <button onclick="selectOption(${index})">
-        Select
-        </button>
-
-        `;
-
-        container.appendChild(card);
-
-    });
-
 }
 
-function selectOption(index) {
 
-    post("select_option", {
-        index: index
-    });
+/* ==========================================================
+   ORCA MESSAGE BRIDGE
+   ========================================================== */
+
+if (
+    window.orca
+    &&
+    window.orca.onMessage
+) {
+
+    window.orca.onMessage(
+        function(data) {
+
+            if (
+                data.type === "analysis"
+            ) {
+
+                updateUI(
+                    data.data
+                );
+
+            }
+
+        }
+    );
 
 }
-
-window.orca.onMessage(receive);
 
 </script>
 
 </body>
-
 </html>
 """
 
 
 # ============================================================
-# PLUGIN CAPABILITY
+# ORCA PLUGIN
 # ============================================================
 
-class EcoSliceAnalysis(
+class EcoSliceScript(
     orca.script.ScriptPluginCapabilityBase
 ):
 
+    def __init__(self):
+
+        self.window = None
+
+        self.analyzer = EcoAnalyzer()
+
     def get_name(self):
 
-        return "EcoSlice AI Optimizer"
+        return "EcoSlice Optimizer"
 
     def execute(self):
 
         try:
 
-            model = orca.host.model()
-
-            result = analyze_model(
-                model,
-                "functional part"
+            # Open the persistent interactive window.
+            self.window = (
+                orca.host.ui.create_window(
+                    html=PAGE,
+                    title="EcoSlice — AI Manufacturing Copilot",
+                    width=1380,
+                    height=900,
+                    on_message=self.on_message,
+                    on_close=self.on_close
+                )
             )
 
-            message = (
-                "EcoSlice analysis complete.\n\n"
-                f"Volume: "
-                f"{result['geometry']['volume_mm3']:.2f} mm³\n"
-                f"Triangles: "
-                f"{result['geometry']['triangles']}\n"
-                f"Support risk: "
-                f"{result['geometry']['support_risk']:.1f}%"
+            # Immediately analyze the currently
+            # loaded model.
+
+            data = (
+                self.analyzer
+                .analyze_current_model()
             )
 
-            return orca.ExecutionResult.success(
-                message
-            )
-
-        except Exception as exc:
-
-            return orca.ExecutionResult.failure(
-                orca.PluginResult.RecoverableError,
-                f"EcoSlice analysis failed: {exc}"
-            )
-
-    def has_config_ui(self):
-
-        return False
-
-
-class EcoSliceDashboard(
-    orca.script.ScriptPluginCapabilityBase
-):
-
-    def get_name(self):
-
-        return "EcoSlice Dashboard"
-
-    def execute(self):
-
-        try:
-
-            model = orca.host.model()
-
-            result = analyze_model(
-                model,
-                "functional part"
-            )
-
-            html = HTML
-
-            dialog_result = orca.host.ui.show_dialog(
-                html=html,
-                title="EcoSlice",
-                width=1000,
-                height=800
-            )
-
-            return orca.ExecutionResult.success(
-                "EcoSlice dashboard opened."
-            )
-
-        except Exception as exc:
-
-            return orca.ExecutionResult.failure(
-                orca.PluginResult.RecoverableError,
-                f"Could not open EcoSlice dashboard: {exc}"
-            )
-
-
-# ============================================================
-# INTERACTIVE DASHBOARD
-# ============================================================
-
-class EcoSliceInteractive(
-    orca.script.ScriptPluginCapabilityBase
-):
-
-    def get_name(self):
-
-        return "EcoSlice Interactive Optimizer"
-
-    def execute(self):
-
-        try:
-
-            self.window = orca.host.ui.create_window(
-                html=HTML,
-                title="EcoSlice AI Optimizer",
-                on_message=self.on_message,
-                on_close=self.on_close
-            )
+            self.window.post({
+                "type": "analysis",
+                "data": data
+            })
 
             return orca.ExecutionResult.success(
                 "EcoSlice optimizer opened."
@@ -1024,60 +2970,73 @@ class EcoSliceInteractive(
 
         except Exception as exc:
 
+            traceback.print_exc()
+
             return orca.ExecutionResult.failure(
                 orca.PluginResult.RecoverableError,
-                f"Could not open EcoSlice: {exc}"
+                str(exc)
             )
 
     def on_message(self, data):
 
-        try:
+        """
+        Called by JavaScript.
 
-            message_type = data.get("type")
+        This is intentionally kept simple.
+        """
 
-            if message_type == "analyze":
+        if not data:
+            return
 
-                model = orca.host.model()
+        message_type = data.get(
+            "type"
+        )
 
-                intent = data.get(
-                    "intent",
-                    "functional part"
+        if message_type == "analyze":
+
+            try:
+
+                result = (
+                    self.analyzer
+                    .analyze_current_model()
                 )
 
-                result = analyze_model(
-                    model,
-                    intent
-                )
+                if self.window:
 
-                self.window.post({
-                    "type": "result",
-                    "result": result
-                })
+                    self.window.post({
+                        "type": "analysis",
+                        "data": result
+                    })
 
-            elif message_type == "select_option":
+            except Exception as exc:
 
-                index = int(
-                    data.get("index", 0)
-                )
+                traceback.print_exc()
 
-                print(
-                    f"EcoSlice selected option {index}"
-                )
+                if self.window:
 
-                self.window.post({
-                    "type": "status",
-                    "message":
-                        "Optimization selected. "
-                        "Actual slicer-setting modification "
-                        "will be added in the slicing-pipeline layer."
-                })
+                    self.window.post({
+                        "type": "error",
+                        "message": str(exc)
+                    })
 
-        except Exception as exc:
+        elif message_type == "select_profile":
 
-            self.window.post({
-                "type": "error",
-                "message": str(exc)
-            })
+            profile = data.get(
+                "profile"
+            )
+
+            print(
+                "EcoSlice selected profile:",
+                profile
+            )
+
+            # IMPORTANT:
+            #
+            # We do NOT modify OrcaSlicer here yet.
+            #
+            # The normal host API is read-only.
+            #
+            # This becomes the next slicing-pipeline stage.
 
     def on_close(self):
 
@@ -1085,22 +3044,16 @@ class EcoSliceInteractive(
 
 
 # ============================================================
-# PLUGIN REGISTRATION
+# PACKAGE REGISTRATION
 # ============================================================
 
 @orca.plugin
-class EcoSlicePlugin(orca.base):
+class EcoSlicePlugin(
+    orca.base
+):
 
     def register_capabilities(self):
 
         orca.register_capability(
-            EcoSliceAnalysis
-        )
-
-        orca.register_capability(
-            EcoSliceDashboard
-        )
-
-        orca.register_capability(
-            EcoSliceInteractive
+            EcoSliceScript
         )
