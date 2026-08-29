@@ -1,355 +1,772 @@
 <!DOCTYPE html>
-
-<html>
+<html lang="en">
 
 <head>
-
     <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
 
     <title>EcoSlice</title>
 
-    <link
-        rel="stylesheet"
-        href="ecoslice.css"
-    >
-
+    <!-- ECOSLICE_CSS -->
 </head>
 
 
 <body>
 
-<div class="app">
+<div id="app">
 
 
-    <!-- HEADER -->
+    <!-- =====================================================
+         SIDEBAR
+         ===================================================== -->
 
-    <header class="header">
+    <aside class="sidebar">
 
-        <div>
+        <div class="logo">
 
-            <div class="brand">
-
-                <span class="logo">
-                    ◉
-                </span>
-
-                EcoSlice
-
+            <div class="logo-mark">
+                E
             </div>
 
-            <div class="subtitle">
+            <div>
 
-                AI-assisted material, energy,
-                and strength optimization
+                <div class="logo-name">
+                    EcoSlice
+                </div>
+
+                <div class="logo-sub">
+                    AI MANUFACTURING
+                </div>
 
             </div>
 
         </div>
 
 
-        <div class="version">
-
-            v0.2.0
-
-        </div>
-
-    </header>
-
-
-
-    <!-- INTENT -->
-
-    <section class="section">
-
-        <div class="section-title">
-
-            <span class="number">
-                01
-            </span>
-
-            Describe the part
-
-        </div>
-
-
-        <textarea
-            id="intent"
-            placeholder="Example: A garden hose holder. It supports 1 kg outdoors. Strength matters more than appearance."
-        ></textarea>
-
-
-        <button
-            id="analyze"
-            class="analyze-button"
-        >
-
-            Analyze current model
-
-        </button>
-
-
-        <div
-            id="status"
-            class="status"
-        ></div>
-
-    </section>
-
-
-
-    <!-- GEOMETRY -->
-
-    <section
-        id="results"
-        class="hidden"
-    >
-
-        <div class="section">
-
-            <div class="section-title">
-
-                <span class="number">
-                    02
-                </span>
-
-                Geometry
-
-            </div>
-
-
-            <div class="metrics">
-
-
-                <div class="metric">
-
-                    <div class="metric-label">
-                        Volume
-                    </div>
-
-                    <div
-                        class="metric-value"
-                        id="volume"
-                    >
-                        —
-                    </div>
-
-                    <div class="metric-unit">
-                        mm³
-                    </div>
-
-                </div>
-
-
-                <div class="metric">
-
-                    <div class="metric-label">
-                        Triangles
-                    </div>
-
-                    <div
-                        class="metric-value"
-                        id="triangles"
-                    >
-                        —
-                    </div>
-
-                    <div class="metric-unit">
-                        mesh faces
-                    </div>
-
-                </div>
-
-
-                <div class="metric">
-
-                    <div class="metric-label">
-                        Support Risk
-                    </div>
-
-                    <div
-                        class="metric-value"
-                        id="risk"
-                    >
-                        —
-                    </div>
-
-                    <div class="metric-unit">
-                        estimated
-                    </div>
-
-                </div>
-
-
-            </div>
-
-        </div>
-
-
-
-        <!-- ENGINEERING INTENT -->
-
-        <div class="section">
-
-            <div class="section-title">
-
-                <span class="number">
-                    03
-                </span>
-
-                Engineering Intent
-
-            </div>
-
-
-            <div class="intent-card">
-
-
-                <div class="intent-row">
-
-                    <span>
-                        Priority
-                    </span>
-
-                    <strong
-                        id="priority"
-                    >
-                        —
-                    </strong>
-
-                </div>
-
-
-                <div class="intent-row">
-
-                    <span>
-                        Load
-                    </span>
-
-                    <strong
-                        id="load"
-                    >
-                        —
-                    </strong>
-
-                </div>
-
-
-                <div class="intent-row">
-
-                    <span>
-                        Outdoor
-                    </span>
-
-                    <strong
-                        id="outdoor"
-                    >
-                        —
-                    </strong>
-
-                </div>
-
-
-                <div class="intent-row">
-
-                    <span>
-                        Vibration
-                    </span>
-
-                    <strong
-                        id="vibration"
-                    >
-                        —
-                    </strong>
-
-                </div>
-
-
-            </div>
-
-        </div>
-
-
-
-        <!-- WARNINGS -->
-
-        <div
-            id="warnings"
-            class="warnings"
-        ></div>
-
-
-
-        <!-- OPTIONS -->
-
-        <div class="section">
-
-            <div class="section-title">
-
-                <span class="number">
-                    04
-                </span>
-
-                Optimization
-
-            </div>
-
-
-            <div
-                id="options"
-                class="options"
-            ></div>
-
-        </div>
-
-
-
-        <!-- CHANGES -->
-
-        <div class="section">
-
-            <div class="section-title">
-
-                <span class="number">
-                    05
-                </span>
-
-                What EcoSlice Changes
-
-            </div>
-
-
-            <div
-                id="explanation"
-                class="changes"
-            ></div>
-
-        </div>
-
-
-
-        <!-- FINAL BUTTON -->
-
-        <div class="footer">
+        <nav class="nav">
 
             <button
-                id="optimize"
-                class="optimize-button"
+                class="nav-item active"
+                onclick="setSection('workspace')"
             >
-
-                ✨ Optimize with EcoSlice
-
+                <span class="nav-icon">◈</span>
+                Workspace
             </button>
+
+
+            <button
+                class="nav-item"
+                onclick="setSection('analysis')"
+            >
+                <span class="nav-icon">◇</span>
+                Analysis
+            </button>
+
+
+            <button
+                class="nav-item"
+                onclick="setSection('compare')"
+            >
+                <span class="nav-icon">⇄</span>
+                Compare
+            </button>
+
+
+            <button
+                class="nav-item"
+                onclick="setSection('validation')"
+            >
+                <span class="nav-icon">✓</span>
+                Validation
+            </button>
+
+        </nav>
+
+
+        <div class="sidebar-bottom">
+
+            <div class="connection">
+
+                <span class="connection-dot"></span>
+
+                <span>
+                    Connected to OrcaSlicer
+                </span>
+
+            </div>
+
+
+            <div class="version-label">
+                EcoSlice v0.2.0
+            </div>
+
+
+            <div class="sidebar-description">
+
+                Optimize material, energy,
+                support, and structural performance.
+
+            </div>
+
+        </div>
+
+    </aside>
+
+
+
+    <!-- =====================================================
+         MAIN APPLICATION
+         ===================================================== -->
+
+    <main class="main">
+
+
+        <!-- =================================================
+             TOP BAR
+             ================================================= -->
+
+        <header class="topbar">
+
+            <div>
+
+                <div class="page-title">
+                    EcoSlice Optimizer
+                </div>
+
+                <div class="page-subtitle">
+                    AI-assisted functional printing optimization
+                </div>
+
+            </div>
+
+
+            <div class="topbar-actions">
+
+                <div class="model-status">
+
+                    <span class="status-dot"></span>
+
+                    Live OrcaSlicer Model
+
+                </div>
+
+
+                <button
+                    class="secondary-button"
+                    onclick="analyze()"
+                >
+                    ↻ Refresh Analysis
+                </button>
+
+            </div>
+
+        </header>
+
+
+
+        <!-- =================================================
+             CONTENT
+             ================================================= -->
+
+        <div class="content">
+
+
+            <!-- =============================================
+                 LEFT / MODEL VIEW
+                 ============================================= -->
+
+            <section class="model-panel">
+
+
+                <!-- MODEL HEADER -->
+
+                <div class="model-header">
+
+                    <div>
+
+                        <div
+                            class="eyebrow"
+                        >
+                            CURRENT MODEL
+                        </div>
+
+
+                        <div
+                            class="model-name"
+                            id="modelName"
+                        >
+                            Current OrcaSlicer Model
+                        </div>
+
+
+                        <div
+                            class="model-sub"
+                            id="modelSub"
+                        >
+                            Waiting for analysis
+                        </div>
+
+                    </div>
+
+
+                    <!-- VISUALIZATION MODE -->
+
+                    <div class="mode-buttons">
+
+                        <button
+                            class="mode active"
+                            onclick="setMode('solid')"
+                            id="solidMode"
+                        >
+                            Solid
+                        </button>
+
+
+                        <button
+                            class="mode"
+                            onclick="setMode('stress')"
+                            id="stressMode"
+                        >
+                            Stress
+                        </button>
+
+
+                        <button
+                            class="mode"
+                            onclick="setMode('supports')"
+                            id="supportsMode"
+                        >
+                            Supports
+                        </button>
+
+                    </div>
+
+                </div>
+
+
+
+                <!-- =========================================
+                     3D / CANVAS VIEW
+                     ========================================= -->
+
+                <div id="viewport">
+
+                    <canvas id="canvas"></canvas>
+
+
+                    <div class="viewport-overlay">
+
+                        <div class="viewport-badge">
+
+                            <span class="live-dot"></span>
+
+                            LIVE GEOMETRY
+
+                        </div>
+
+
+                        <div class="viewport-hint">
+
+                            Drag to rotate
+                            <span>·</span>
+                            Scroll to zoom
+
+                        </div>
+
+                    </div>
+
+                </div>
+
+
+
+                <!-- =========================================
+                     MODEL METRICS
+                     ========================================= -->
+
+                <div class="model-stats">
+
+
+                    <div class="stat">
+
+                        <div class="stat-label">
+                            DIMENSIONS
+                        </div>
+
+                        <div
+                            class="stat-value"
+                            id="dimensions"
+                        >
+                            —
+                        </div>
+
+                    </div>
+
+
+                    <div class="stat">
+
+                        <div class="stat-label">
+                            VOLUME
+                        </div>
+
+                        <div
+                            class="stat-value"
+                            id="volume"
+                        >
+                            —
+                        </div>
+
+                    </div>
+
+
+                    <div class="stat">
+
+                        <div class="stat-label">
+                            TRIANGLES
+                        </div>
+
+                        <div
+                            class="stat-value"
+                            id="triangles"
+                        >
+                            —
+                        </div>
+
+                    </div>
+
+
+                    <div class="stat">
+
+                        <div class="stat-label">
+                            SUPPORT RISK
+                        </div>
+
+                        <div
+                            class="stat-value highlight"
+                            id="supportRisk"
+                        >
+                            —
+                        </div>
+
+                    </div>
+
+                </div>
+
+
+            </section>
+
+
+
+            <!-- =============================================
+                 RIGHT PANEL
+                 ============================================= -->
+
+            <section class="right">
+
+
+                <!-- =========================================
+                     DESIGN INTENT
+                     ========================================= -->
+
+                <div class="card intent-card">
+
+                    <div class="eyebrow">
+                        DESIGN INTENT
+                    </div>
+
+
+                    <h2>
+                        What does this part need to do?
+                    </h2>
+
+
+                    <p class="description">
+
+                        Describe the real-world job of the
+                        part. EcoSlice uses this information
+                        to influence the optimization strategy.
+
+                    </p>
+
+
+                    <textarea
+                        id="intent"
+                        placeholder="Example: This is a garden hose holder. It supports 1 kg outdoors. Strength matters more than appearance."
+                    ></textarea>
+
+
+                    <div class="intent-examples">
+
+                        <button
+                            onclick="setIntent('A functional bracket that needs high strength.')"
+                        >
+                            Structural bracket
+                        </button>
+
+
+                        <button
+                            onclick="setIntent('A lightweight part where minimizing material is important.')"
+                        >
+                            Lightweight part
+                        </button>
+
+
+                        <button
+                            onclick="setIntent('A part used outdoors that must tolerate vibration.')"
+                        >
+                            Outdoor mount
+                        </button>
+
+                    </div>
+
+
+                    <button
+                        class="primary"
+                        onclick="analyze()"
+                    >
+
+                        <span>
+                            Analyze & Optimize
+                        </span>
+
+                        <span class="button-arrow">
+                            →
+                        </span>
+
+                    </button>
+
+
+                    <div
+                        id="status"
+                        class="status-message"
+                    ></div>
+
+                </div>
+
+
+
+                <!-- =========================================
+                     ENGINEERING ANALYSIS
+                     ========================================= -->
+
+                <div class="card">
+
+                    <div class="section-title">
+
+                        <span>
+                            ENGINEERING ANALYSIS
+                        </span>
+
+
+                        <span class="badge">
+                            LIVE MODEL
+                        </span>
+
+                    </div>
+
+
+                    <div class="analysis-grid">
+
+
+                        <div class="control">
+
+                            <div class="control-icon">
+                                ◒
+                            </div>
+
+                            <div class="control-info">
+
+                                <span class="control-name">
+                                    Overhang analysis
+                                </span>
+
+                                <span
+                                    class="control-value"
+                                    id="overhang"
+                                >
+                                    —
+                                </span>
+
+                            </div>
+
+                        </div>
+
+
+                        <div class="control">
+
+                            <div class="control-icon">
+                                ◈
+                            </div>
+
+                            <div class="control-info">
+
+                                <span class="control-name">
+                                    Stress map
+                                </span>
+
+                                <span
+                                    class="control-value"
+                                    id="stress"
+                                >
+                                    —
+                                </span>
+
+                            </div>
+
+                        </div>
+
+
+                        <div class="control">
+
+                            <div class="control-icon">
+                                ▦
+                            </div>
+
+                            <div class="control-info">
+
+                                <span class="control-name">
+                                    Support regions
+                                </span>
+
+                                <span
+                                    class="control-value"
+                                    id="supportCount"
+                                >
+                                    —
+                                </span>
+
+                            </div>
+
+                        </div>
+
+
+                        <div class="control">
+
+                            <div class="control-icon">
+                                ✓
+                            </div>
+
+                            <div class="control-info">
+
+                                <span class="control-name">
+                                    Watertight
+                                </span>
+
+                                <span
+                                    class="control-value"
+                                    id="watertight"
+                                >
+                                    —
+                                </span>
+
+                            </div>
+
+                        </div>
+
+                    </div>
+
+                </div>
+
+
+
+                <!-- =========================================
+                     OPTIMIZATION OPTIONS
+                     ========================================= -->
+
+                <div class="card">
+
+                    <div class="section-title">
+
+                        <div>
+
+                            <span>
+                                OPTIMIZATION OPTIONS
+                            </span>
+
+                            <div class="section-description">
+                                Choose how EcoSlice should
+                                prioritize the print.
+                            </div>
+
+                        </div>
+
+                    </div>
+
+
+                    <div id="profiles">
+
+                        <div class="empty-state">
+
+                            <div class="empty-icon">
+                                ✦
+                            </div>
+
+                            <div>
+                                Analyze the model to generate
+                                optimization profiles.
+                            </div>
+
+                        </div>
+
+                    </div>
+
+                </div>
+
+
+
+                <!-- =========================================
+                     CHANGES
+                     ========================================= -->
+
+                <div class="card">
+
+                    <div class="section-title">
+
+                        <span>
+                            WHAT ECOSLICE WOULD CHANGE
+                        </span>
+
+                    </div>
+
+
+                    <div id="changes">
+
+                        <div class="empty-state">
+
+                            No recommendations yet.
+
+                        </div>
+
+                    </div>
+
+                </div>
+
+
+
+                <!-- =========================================
+                     VISUALIZATION LEGEND
+                     ========================================= -->
+
+                <div class="card">
+
+                    <div class="section-title">
+
+                        <span>
+                            VISUALIZATION
+                        </span>
+
+                    </div>
+
+
+                    <div class="legend">
+
+
+                        <div class="legend-item">
+
+                            <span
+                                class="legend-dot"
+                                style="background:#3dd9b5"
+                            ></span>
+
+                            Lower stress
+
+                        </div>
+
+
+                        <div class="legend-item">
+
+                            <span
+                                class="legend-dot"
+                                style="background:#e8c95c"
+                            ></span>
+
+                            Medium
+
+                        </div>
+
+
+                        <div class="legend-item">
+
+                            <span
+                                class="legend-dot"
+                                style="background:#ff756f"
+                            ></span>
+
+                            Higher stress
+
+                        </div>
+
+
+                        <div class="legend-item">
+
+                            <span
+                                class="legend-dot"
+                                style="background:#f0d45a"
+                            ></span>
+
+                            Support
+
+                        </div>
+
+                    </div>
+
+                </div>
+
+
+
+                <!-- =========================================
+                     FINAL ACTION
+                     ========================================= -->
+
+                <div class="action-card">
+
+                    <div>
+
+                        <div class="action-title">
+                            Ready to optimize?
+                        </div>
+
+                        <div class="action-description">
+                            EcoSlice will apply the selected
+                            strategy to the current model.
+                        </div>
+
+                    </div>
+
+
+                    <button
+                        class="optimize-button"
+                        onclick="optimizeSelected()"
+                    >
+
+                        ✨ Optimize
+
+                    </button>
+
+                </div>
+
+
+            </section>
+
 
         </div>
 
 
-    </section>
+    </main>
 
 
 </div>
 
 
-<script src="ecoslice.js"></script>
+<!-- =========================================================
+     JAVASCRIPT
+     ========================================================= -->
+
+<!-- ECOSLICE_JS -->
+
 
 </body>
 

@@ -5,13 +5,66 @@
 import json
 import math
 import traceback
+from pathlib import Path
 
 import numpy as np
 import orca
 
-
 PLUGIN_VERSION = "0.2.0"
+# ============================================================
+# EXTERNAL UI LOADER
+# ============================================================
 
+PLUGIN_DIR = Path(__file__).resolve().parent
+UI_DIR = PLUGIN_DIR / "ui"
+
+
+def load_ecoslice_ui():
+    """
+    Load the UI from:
+
+        plugin/ui/ecoslice.html
+        plugin/ui/ecoslice.css
+        plugin/ui/ecoslice.js
+
+    Then inject CSS and JS directly into the HTML so the
+    OrcaSlicer plugin window can render everything as one page.
+    """
+
+    html_path = UI_DIR / "ecoslice.html"
+    css_path = UI_DIR / "ecoslice.css"
+    js_path = UI_DIR / "ecoslice.js"
+
+    if not html_path.exists():
+        raise RuntimeError(
+            f"EcoSlice UI HTML not found: {html_path}"
+        )
+
+    if not css_path.exists():
+        raise RuntimeError(
+            f"EcoSlice CSS not found: {css_path}"
+        )
+
+    if not js_path.exists():
+        raise RuntimeError(
+            f"EcoSlice JavaScript not found: {js_path}"
+        )
+
+    html = html_path.read_text(encoding="utf-8")
+    css = css_path.read_text(encoding="utf-8")
+    js = js_path.read_text(encoding="utf-8")
+
+    html = html.replace(
+        "<!-- ECOSLICE_CSS -->",
+        f"<style>\n{css}\n</style>"
+    )
+
+    html = html.replace(
+        "<!-- ECOSLICE_JS -->",
+        f"<script>\n{js}\n</script>"
+    )
+
+    return html
 
 # ============================================================
 # ECO SLICE ANALYSIS ENGINE
@@ -2942,7 +2995,7 @@ class EcoSliceScript(
             # Open the persistent interactive window.
             self.window = (
                 orca.host.ui.create_window(
-                    html=PAGE,
+                    html=load_ecoslice_ui(),
                     title="EcoSlice — AI Manufacturing Copilot",
                     width=1380,
                     height=900,
