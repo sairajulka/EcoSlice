@@ -9,728 +9,262 @@
 # version = "0.2.1"
 # ///
 
-from pathlib import Path
+import json
+import math
+import os
 import traceback
+
 import numpy as np
 import orca
 
 
 PLUGIN_VERSION = "0.2.1"
 
-PLUGIN_DIR = Path(__file__).resolve().parent
-UI_DIR = PLUGIN_DIR / "ui"
-
 
 # ============================================================
-# LOAD THE REAL ECO SLICE UI
+# HELPERS
 # ============================================================
 
-def load_ui():
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
 
-    html_file = UI_DIR / "ecoslice.html"
-    css_file = UI_DIR / "ecoslice.css"
-    js_file = UI_DIR / "ecoslice.js"
 
-    if not html_file.exists():
-        raise FileNotFoundError(
-            f"Missing {html_file}"
-        )
+def format_number(value, decimals=0):
+    if decimals == 0:
+        return f"{int(round(value)):,}"
+    return f"{value:,.{decimals}f}"
 
-    if not css_file.exists():
-        raise FileNotFoundError(
-            f"Missing {css_file}"
-        )
 
-    if not js_file.exists():
-        raise FileNotFoundError(
-            f"Missing {js_file}"
-        )
+def calculate_support_risk(vertices, triangles):
+    """
+    Lightweight geometry heuristic.
 
-    html = html_file.read_text(
-        encoding="utf-8"
+    This is NOT a physics simulation. It estimates how much geometry
+    may require support based on downward-facing triangles.
+    """
+
+    if len(vertices) == 0 or len(triangles) == 0:
+        return 0.0
+
+    try:
+        v = np.asarray(vertices, dtype=np.float64)
+        t = np.asarray(triangles, dtype=np.int64)
+
+        if len(t) > 100000:
+            # Keep the UI responsive on high-poly meshes.
+            step = max(1, len(t) // 100000)
+            t = t[::step]
+
+        p1 = v[t[:, 0]]
+        p2 = v[t[:, 1]]
+        p3 = v[t[:, 2]]
+
+        a = p2 - p1
+        b = p3 - p1
+
+        normals = np.cross(a, b)
+
+        lengths = np.linalg.norm(normals, axis=1)
+        valid = lengths > 1e-12
+
+        normals = normals[valid]
+        lengths = lengths[valid]
+
+        if len(normals) == 0:
+            return 0.0
+
+        normals = normals / lengths[:, None]
+
+        # Z component tells us how downward-facing the surface is.
+        downward = np.clip(-normals[:, 2], 0.0, 1.0)
+
+        risk = float(np.mean(downward) * 100.0)
+
+        return min(100.0, max(0.0, risk))
+
+    except Exception:
+        return 0.0
+
+
+def parse_intent(text):
+    """
+    Simple local intent parser.
+
+    Examples:
+        "strength"
+        "supports 1 kg"
+        "outdoors"
+        "vibration"
+    """
+
+    text = (text or "").lower()
+
+    priority = "balanced"
+
+    if any(word in text for word in [
+        "strength",
+        "strong",
+        "load",
+        "structural",
+        "durable",
+    ]):
+        priority = "strength"
+
+    elif any(word in text for word in [
+        "lightweight",
+        "light",
+        "material",
+        "eco",
+        "sustainable",
+        "cheap",
+    ]):
+        priority = "eco"
+
+    load = "Not specified"
+
+    import re
+
+    match = re.search(
+        r"(\d+(?:\.\d+)?)\s*(kg|kilogram|kilograms|g|gram|grams)",
+        text,
     )
 
-    css = css_file.read_text(
-        encoding="utf-8"
-    )
-
-    js = js_file.read_text(
-        encoding="utf-8"
-    )
-
-    # We inject CSS/JS directly into the window.
-    # This is much more reliable inside OrcaSlicer.
-
-    html = html.replace(
-        "</head>",
-        f"""
-<style>
-{css}
-</style>
-</head>
-""",
-        1
-    )
-
-    html = html.replace(
-        "</body>",
-        f"""
-<script>
-{js}
-</script>
-</body>
-""",
-        1
-    )
-
-    return html
-
-
-# ============================================================
-# ECO SLICE ANALYZER
-# ============================================================
-
-class EcoAnalyzer:
-
-    def __init__(self):
-        self.last_result = None
-
-    def analyze(self):
-
-        model = orca.host.model()
-
-        objects = model.objects()
-
-        if not objects:
-            raise RuntimeError(
-                "No model is loaded in OrcaSlicer."
-            )
-
-        all_vertices = []
-        all_triangles = []
-
-        reports = []
-
-        vertex_offset = 0
-
-        # ----------------------------------------------------
-        # READ ORCASLICER MODEL
-        # ----------------------------------------------------
-
-        for object_index, obj in enumerate(objects):
-
-            for volume_index, volume in enumerate(
-                obj.volumes()
-            ):
-
-                mesh = volume.mesh()
-
-                if mesh.is_empty():
-                    continue
-
-                vertices = np.asarray(
-                    mesh.vertices(),
-                    dtype=np.float64
-                )
-
-                triangles = np.asarray(
-                    mesh.triangles(),
-                    dtype=np.int32
-                )
-
-                if len(vertices) == 0:
-                    continue
-
-                # Convert model to world coordinates.
-                try:
-
-                    instance = obj.instance(0)
-
-                    matrix = (
-                        instance.matrix()
-                        @ volume.matrix()
-                    )
-
-                    homogeneous = np.c_[
-                        vertices,
-                        np.ones(len(vertices))
-                    ]
-
-                    world_vertices = (
-                        homogeneous
-                        @ matrix.T
-                    )[:, :3]
-
-                except Exception:
-
-                    world_vertices = vertices
-
-                world_triangles = (
-                    triangles
-                    + vertex_offset
-                )
-
-                all_vertices.append(
-                    world_vertices
-                )
-
-                all_triangles.append(
-                    world_triangles
-                )
-
-                vertex_offset += len(
-                    world_vertices
-                )
-
-                reports.append({
-                    "name": getattr(
-                        volume,
-                        "name",
-                        f"Object {object_index + 1}"
-                    ),
-
-                    "volume_mm3": float(
-                        mesh.volume()
-                    ),
-
-                    "triangles": int(
-                        mesh.triangle_count()
-                    ),
-
-                    "manifold": bool(
-                        mesh.is_manifold()
-                    )
-                })
-
-        if not all_vertices:
-
-            raise RuntimeError(
-                "No mesh geometry was found."
-            )
-
-        vertices = np.vstack(
-            all_vertices
-        )
-
-        triangles = np.vstack(
-            all_triangles
-        )
-
-        # ----------------------------------------------------
-        # GEOMETRY
-        # ----------------------------------------------------
-
-        minimum = vertices.min(
-            axis=0
-        )
-
-        maximum = vertices.max(
-            axis=0
-        )
-
-        dimensions = (
-            maximum - minimum
-        )
-
-        volume = sum(
-            r["volume_mm3"]
-            for r in reports
-        )
-
-        # ----------------------------------------------------
-        # TRIANGLE NORMALS
-        # ----------------------------------------------------
-
-        tri_vertices = vertices[
-            triangles
-        ]
-
-        edge_a = (
-            tri_vertices[:, 1]
-            - tri_vertices[:, 0]
-        )
-
-        edge_b = (
-            tri_vertices[:, 2]
-            - tri_vertices[:, 0]
-        )
-
-        normals = np.cross(
-            edge_a,
-            edge_b
-        )
-
-        lengths = np.linalg.norm(
-            normals,
-            axis=1
-        )
-
-        lengths[lengths == 0] = 1
-
-        normals /= lengths[:, None]
-
-        # ----------------------------------------------------
-        # SUPPORT RISK
-        # ----------------------------------------------------
-
-        downward = -normals[:, 2]
-
-        support_mask = (
-            downward > 0.5
-        )
-
-        support_ratio = (
-            float(
-                np.mean(support_mask)
-            )
-            if len(support_mask)
-            else 0
-        )
-
-        support_risk = min(
-            99,
-            support_ratio * 100
-        )
-
-        # ----------------------------------------------------
-        # VISUAL STRESS HEURISTIC
-        #
-        # This is NOT FEA.
-        # It is a visualization heuristic.
-        # ----------------------------------------------------
-
-        centers = tri_vertices.mean(
-            axis=1
-        )
-
-        z_min = minimum[2]
-
-        z_range = max(
-            0.001,
-            maximum[2] - z_min
-        )
-
-        height = (
-            centers[:, 2] - z_min
-        ) / z_range
-
-        stress = (
-            0.55
-            * np.clip(
-                downward,
-                0,
-                1
-            )
-            +
-            0.25 * height
-            +
-            0.20
-            * np.abs(
-                normals[:, 0]
-            )
-        )
-
-        stress = np.clip(
-            stress,
-            0,
-            1
-        )
-
-        # ----------------------------------------------------
-        # SUPPORT VISUALIZATION
-        # ----------------------------------------------------
-
-        supports = []
-
-        support_indices = np.where(
-            support_mask
-        )[0]
-
-        max_supports = 80
-
-        if len(support_indices) > max_supports:
-
-            indices = np.linspace(
-                0,
-                len(support_indices) - 1,
-                max_supports
-            ).astype(int)
-
-            support_indices = (
-                support_indices[indices]
-            )
-
-        bottom_z = float(
-            vertices[:, 2].min()
-        )
-
-        for i in support_indices:
-
-            triangle = triangles[i]
-
-            top = vertices[
-                triangle
-            ].mean(axis=0)
-
-            supports.append({
-                "top": [
-                    round(float(top[0]), 2),
-                    round(float(top[1]), 2),
-                    round(float(top[2]), 2)
-                ],
-
-                "bottom": [
-                    round(float(top[0]), 2),
-                    round(float(top[1]), 2),
-                    round(bottom_z, 2)
-                ]
-            })
-
-        # ----------------------------------------------------
-        # SEND A LIGHTWEIGHT MESH TO THE UI
-        # ----------------------------------------------------
-
-        max_triangles = 4500
-
-        if len(triangles) > max_triangles:
-
-            indices = np.linspace(
-                0,
-                len(triangles) - 1,
-                max_triangles
-            ).astype(int)
-
+    if match:
+        amount = match.group(1)
+        unit = match.group(2)
+
+        if unit.startswith("kg") or unit.startswith("kilogram"):
+            load = f"{amount} kg"
         else:
+            load = f"{amount} g"
 
-            indices = np.arange(
-                len(triangles)
-            )
+    outdoor = any(word in text for word in [
+        "outdoor",
+        "outside",
+        "weather",
+        "rain",
+        "sun",
+    ])
 
-        browser_vertices = []
-        browser_stress = []
+    vibration = any(word in text for word in [
+        "vibration",
+        "vibrating",
+        "shock",
+        "impact",
+    ])
 
-        for i in indices:
+    return {
+        "priority": priority,
+        "load": load,
+        "outdoor": outdoor,
+        "vibration": vibration,
+    }
 
-            tri = triangles[i]
 
-            browser_vertices.extend([
-                vertices[tri[0]].tolist(),
-                vertices[tri[1]].tolist(),
-                vertices[tri[2]].tolist()
-            ])
+def make_optimization_options(volume_mm3, intent, support_risk):
+    """
+    Generate the three optimization recommendations.
 
-            s = float(
-                stress[i]
-            )
+    These are engineering heuristics for the prototype, not certified
+    structural calculations.
+    """
 
-            browser_stress.extend([
-                s,
-                s,
-                s
-            ])
+    priority = intent.get("priority", "balanced")
 
-        # ----------------------------------------------------
-        # OPTIMIZATION PROFILES
-        # ----------------------------------------------------
+    # Approximate PLA density in g/mm³.
+    density = 0.00124
 
-        base_material = (
-            volume / 1000
-        ) * 0.00124
+    # Approximate printed material volume fractions.
+    profiles = {
+        "eco": {
+            "walls": 2,
+            "infill": 12,
+            "factor": 0.30,
+            "time_factor": 0.70,
+            "strength": 71,
+        },
+        "balanced": {
+            "walls": 4,
+            "infill": 30,
+            "factor": 0.46,
+            "time_factor": 1.00,
+            "strength": 87,
+        },
+        "maximum": {
+            "walls": 6,
+            "infill": 55,
+            "factor": 0.66,
+            "time_factor": 1.42,
+            "strength": 96,
+        },
+    }
 
-        base_material *= (
-            1
-            + support_risk / 200
+    # Increase support/material estimates for geometry with greater
+    # support risk.
+    support_multiplier = 1.0 + (support_risk / 100.0) * 0.15
+
+    result = []
+
+    for key, profile in profiles.items():
+
+        material_volume = (
+            volume_mm3
+            * profile["factor"]
+            * support_multiplier
         )
 
-        base_time = (
-            0.25
-            + volume / 250000
+        material_g = material_volume * density
+
+        # Prototype print-time model.
+        time_hours = (
+            max(0.15, material_g / 8.0)
+            * profile["time_factor"]
         )
 
-        base_time *= (
-            1
-            + support_risk / 150
-        )
+        energy_kwh = time_hours * 0.115
 
-        definitions = [
+        co2_kg = energy_kwh * 0.38
 
-            (
-                "eco",
-                "Eco",
-                "MINIMUM RESOURCE",
-                2,
-                12,
-                0.72,
-                0.71
-            ),
+        strength = profile["strength"]
 
-            (
-                "balanced",
-                "Balanced",
-                "RECOMMENDED",
-                4,
-                30,
-                1.00,
-                0.87
-            ),
+        if priority == "strength":
+            if key == "eco":
+                strength -= 4
+            elif key == "maximum":
+                strength += 1
 
-            (
-                "maximum",
-                "Maximum Strength",
-                "STRUCTURAL",
-                6,
-                55,
-                1.43,
-                0.96
-            )
-        ]
+        result.append({
+            "id": key,
+            "name": {
+                "eco": "Eco",
+                "balanced": "Balanced",
+                "maximum": "Maximum Strength",
+            }[key],
 
-        profiles = []
+            "description": {
+                "eco": "Minimize material and print time",
+                "balanced": "Balance strength, material, and time",
+                "maximum": "Prioritize structural robustness",
+            }[key],
 
-        for (
-            profile_id,
-            name,
-            tag,
-            walls,
-            infill,
-            multiplier,
-            confidence
-        ) in definitions:
+            "walls": profile["walls"],
+            "infill": profile["infill"],
 
-            material = (
-                base_material
-                * multiplier
-            )
-
-            time = (
-                base_time
-                * multiplier
-            )
-
-            energy = (
-                time * 0.12
-            )
-
-            co2 = (
-                energy * 0.38
-            )
-
-            profiles.append({
-
-                "id": profile_id,
-
-                "name": name,
-
-                "tag": tag,
-
-                "walls": walls,
-
-                "infill": infill,
-
-                "material_g": round(
-                    material,
-                    2
-                ),
-
-                "time_h": round(
-                    time,
-                    2
-                ),
-
-                "time_hours": round(
-                    time,
-                    2
-                ),
-
-                "energy_kwh": round(
-                    energy,
-                    2
-                ),
-
-                "co2_kg": round(
-                    co2,
-                    3
-                ),
-
-                "confidence": round(
-                    confidence * 100
-                ),
-
-                "strength_confidence":
-                    round(
-                        confidence * 100
-                    )
-            })
-
-        # ----------------------------------------------------
-        # RECOMMENDATIONS
-        # ----------------------------------------------------
-
-        changes = []
-
-        if float(
-            stress.max()
-        ) > 0.8:
-
-            changes.append({
-                "severity": "critical",
-
-                "title":
-                    "Reinforce high-stress regions",
-
-                "body":
-                    "EcoSlice identifies regions "
-                    "that may benefit from additional "
-                    "wall thickness or infill density."
-            })
-
-        if support_risk > 10:
-
-            changes.append({
-                "severity": "medium",
-
-                "title":
-                    "Localize support material",
-
-                "body":
-                    "Downward-facing regions above "
-                    "the support threshold are shown "
-                    "as support candidates."
-            })
-
-        changes.append({
-            "severity": "medium",
-
-            "title":
-                "Compare print strategies",
-
-            "body":
-                "EcoSlice compares material, estimated "
-                "print time, energy consumption, and "
-                "structural confidence."
+            "material_g": round(material_g, 1),
+            "time_h": round(time_hours, 2),
+            "energy_kwh": round(energy_kwh, 2),
+            "co2_kg": round(co2_kg, 2),
+            "strength_confidence": min(99, max(1, strength)),
         })
 
-        # ----------------------------------------------------
-        # FINAL DATA SENT TO JAVASCRIPT
-        # ----------------------------------------------------
-
-        result = {
-
-            "version":
-                PLUGIN_VERSION,
-
-            "objects":
-                reports,
-
-            "geometry": {
-
-                "volume_mm3":
-                    round(volume, 2),
-
-                "triangles":
-                    int(len(triangles)),
-
-                "dimensions_mm": [
-                    round(
-                        float(x),
-                        2
-                    )
-                    for x in dimensions
-                ],
-
-                "support_risk":
-                    round(
-                        support_risk,
-                        1
-                    ),
-
-                "manifold":
-                    all(
-                        r["manifold"]
-                        for r in reports
-                    ),
-
-                "thin_feature_warning":
-                    float(
-                        np.min(dimensions)
-                    ) < 1.2
-            },
-
-            "analysis": {
-
-                "overhang_faces":
-                    int(
-                        np.sum(
-                            support_mask
-                        )
-                    ),
-
-                "stress_max":
-                    round(
-                        float(
-                            stress.max()
-                        ),
-                        3
-                    ),
-
-                "stress_mean":
-                    round(
-                        float(
-                            stress.mean()
-                        ),
-                        3
-                    ),
-
-                "support_points":
-                    len(supports)
-            },
-
-            "mesh": {
-
-                "vertices": [
-                    [
-                        round(
-                            float(v[0]),
-                            2
-                        ),
-                        round(
-                            float(v[1]),
-                            2
-                        ),
-                        round(
-                            float(v[2]),
-                            2
-                        )
-                    ]
-                    for v in browser_vertices
-                ],
-
-                "stress": [
-                    round(
-                        float(x),
-                        3
-                    )
-                    for x in browser_stress
-                ]
-            },
-
-            "supports":
-                supports,
-
-            "profiles":
-                profiles,
-
-            "changes":
-                changes
-        }
-
-        self.last_result = result
-
-        return result
+    return result
 
 
 # ============================================================
-# THE ONE ECO SLICE CAPABILITY
+# MAIN ECOSLICE CAPABILITY
 # ============================================================
 
 class EcoSliceOptimizer(
@@ -738,197 +272,188 @@ class EcoSliceOptimizer(
 ):
 
     def __init__(self):
+        # IMPORTANT:
+        # OrcaSlicer requires the typed base class initializer
+        # to be called when overriding __init__.
+        super().__init__()
 
-        self.window = None
-
-        self.analyzer = (
-            EcoAnalyzer()
-        )
+        self.last_analysis = None
 
     def get_name(self):
+        return "EcoSlice AI Optimizer"
 
-        return "EcoSlice Optimizer"
+    def on_load(self):
+        """
+        Called when the capability is loaded.
+        """
+
+        self.last_analysis = None
+
+    def on_unload(self):
+        """
+        Called when the capability is unloaded.
+        """
+
+        self.last_analysis = None
 
     def execute(self):
+        """
+        Main entry point when the user clicks Run in the
+        OrcaSlicer Plugins window.
+        """
 
         try:
+            model = orca.host.model()
 
-            page = load_ui()
+            if model is None:
+                return orca.ExecutionResult.failure(
+                    orca.PluginResult.RecoverableError,
+                    "EcoSlice could not access the current OrcaSlicer model."
+                )
 
-            self.window = (
-                orca.host.ui.create_window(
-                    html=page,
+            objects = model.objects()
 
-                    title=(
-                        "EcoSlice — "
-                        "AI Manufacturing Copilot"
+            if not objects:
+                return orca.ExecutionResult.failure(
+                    orca.PluginResult.RecoverableError,
+                    "No model is currently loaded in OrcaSlicer."
+                )
+
+            total_volume = 0.0
+            total_triangles = 0
+            support_risks = []
+
+            object_results = []
+
+            for obj_index, obj in enumerate(objects):
+
+                object_volume = 0.0
+                object_triangles = 0
+
+                for volume_index, volume in enumerate(obj.volumes()):
+
+                    mesh = volume.mesh()
+
+                    if mesh is None:
+                        continue
+
+                    vertices = np.asarray(
+                        mesh.vertices(),
+                        dtype=np.float64,
+                    )
+
+                    triangles = np.asarray(
+                        mesh.triangles(),
+                        dtype=np.int64,
+                    )
+
+                    triangle_count = len(triangles)
+
+                    object_triangles += triangle_count
+
+                    # Calculate volume using signed tetrahedra.
+                    try:
+                        if triangle_count > 150000:
+                            step = max(
+                                1,
+                                triangle_count // 150000
+                            )
+                            calc_triangles = triangles[::step]
+                        else:
+                            calc_triangles = triangles
+
+                        p1 = vertices[calc_triangles[:, 0]]
+                        p2 = vertices[calc_triangles[:, 1]]
+                        p3 = vertices[calc_triangles[:, 2]]
+
+                        volume_value = np.sum(
+                            np.einsum(
+                                "ij,ij->i",
+                                p1,
+                                np.cross(p2, p3),
+                            )
+                        ) / 6.0
+
+                        volume_value = abs(float(volume_value))
+
+                    except Exception:
+                        volume_value = 0.0
+
+                    object_volume += volume_value
+
+                    risk = calculate_support_risk(
+                        vertices,
+                        triangles,
+                    )
+
+                    support_risks.append(risk)
+
+                total_volume += object_volume
+                total_triangles += object_triangles
+
+                object_results.append({
+                    "index": obj_index + 1,
+                    "volume_mm3": object_volume,
+                    "triangles": object_triangles,
+                })
+
+            if not object_results:
+                return orca.ExecutionResult.failure(
+                    orca.PluginResult.RecoverableError,
+                    "EcoSlice found no usable mesh geometry."
+                )
+
+            support_risk = (
+                sum(support_risks) / len(support_risks)
+                if support_risks
+                else 0.0
+            )
+
+            analysis = {
+                "plugin_version": PLUGIN_VERSION,
+
+                "geometry": {
+                    "volume_mm3": round(total_volume, 2),
+                    "triangles": total_triangles,
+                    "support_risk": round(
+                        support_risk,
+                        1,
                     ),
+                },
 
-                    width=1380,
+                "objects": object_results,
+            }
 
-                    height=900,
+            self.last_analysis = analysis
 
-                    on_message=
-                        self.on_message,
+            # ----------------------------------------------------
+            # Create the user-facing result.
+            # ----------------------------------------------------
 
-                    on_close=
-                        self.on_close
-                )
+            message = (
+                "EcoSlice analysis complete.\n\n"
+                f"Volume: {format_number(total_volume, 2)} mm³\n"
+                f"Triangles: {format_number(total_triangles)}\n"
+                f"Estimated support risk: {support_risk:.1f}%"
             )
 
-            # Automatically analyze the
-            # current OrcaSlicer model.
-
-            result = (
-                self.analyzer.analyze()
-            )
-
-            self.window.post({
-
-                "type":
-                    "analysis",
-
-                "data":
-                    result
-            })
-
-            return (
-                orca.ExecutionResult.success(
-                    "EcoSlice Optimizer opened."
-                )
+            return orca.ExecutionResult.success(
+                message,
+                json.dumps(analysis),
             )
 
         except Exception as exc:
 
             traceback.print_exc()
 
-            return (
-                orca.ExecutionResult.failure(
-                    orca.PluginResult.RecoverableError,
-                    f"EcoSlice failed: {exc}"
-                )
+            return orca.ExecutionResult.failure(
+                orca.PluginResult.RecoverableError,
+                f"EcoSlice analysis failed: {exc}",
             )
-
-    def on_message(self, data):
-
-        if not data:
-            return
-
-        message_type = data.get(
-            "type"
-        )
-
-        # ----------------------------------------------------
-        # ANALYZE
-        # ----------------------------------------------------
-
-        if message_type == "analyze":
-
-            try:
-
-                if self.window:
-
-                    self.window.post({
-                        "type":
-                            "status",
-
-                        "message":
-                            "Analyzing current model..."
-                    })
-
-                result = (
-                    self.analyzer.analyze()
-                )
-
-                if self.window:
-
-                    self.window.post({
-
-                        "type":
-                            "analysis",
-
-                        "data":
-                            result
-                    })
-
-            except Exception as exc:
-
-                traceback.print_exc()
-
-                if self.window:
-
-                    self.window.post({
-
-                        "type":
-                            "error",
-
-                        "message":
-                            str(exc)
-                    })
-
-        # ----------------------------------------------------
-        # SELECT PROFILE
-        # ----------------------------------------------------
-
-        elif message_type == "select_profile":
-
-            profile = data.get(
-                "profile",
-                "balanced"
-            )
-
-            print(
-                "EcoSlice selected:",
-                profile
-            )
-
-            if self.window:
-
-                self.window.post({
-
-                    "type":
-                        "status",
-
-                    "message":
-                        f"{profile.title()} "
-                        "profile selected."
-                })
-
-        # ----------------------------------------------------
-        # OPTIMIZE
-        # ----------------------------------------------------
-
-        elif message_type == "optimize":
-
-            profile = data.get(
-                "profile",
-                "balanced"
-            )
-
-            print(
-                "EcoSlice optimization:",
-                profile
-            )
-
-            if self.window:
-
-                self.window.post({
-
-                    "type":
-                        "status",
-
-                    "message":
-                        "Optimization profile selected. "
-                        "Ready for slicing."
-                })
-
-    def on_close(self):
-
-        self.window = None
 
 
 # ============================================================
-# REGISTER ONLY THIS CAPABILITY
+# PLUGIN PACKAGE
 # ============================================================
 
 @orca.plugin
